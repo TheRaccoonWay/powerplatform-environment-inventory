@@ -1,0 +1,350 @@
+# =============================================================================
+# setup-lists.yml
+# Legt die SharePoint-Listen für das Umgebungs-Inventar an.
+# Einmalig auszuführen, danach nur bei neuen Spalten oder neuen Listen erneut.
+#
+# Welche Listen? Im Run-Dialog pro Liste ein Häkchen:
+#   - Environments  Register aller Umgebungen und Arbeitsliste
+#   - Solutions     Solutions pro Umgebung, Auswahl für das Backup
+# Weitere Listen (z. B. Publisher) kommen später als zusätzliches Häkchen.
+# Die Namen der Listen sind Parameter (Standard: Environments und Solutions).
+# inventory.yml bekommt dieselben Parameter und muss dieselben Namen nutzen.
+#
+# Wiederholbar (idempotent), pro ausgewählter Liste:
+#   - Gibt es die Liste noch nicht, wird sie mit allen Spalten angelegt.
+#   - Gibt es sie schon, werden FEHLENDE Spalten ergänzt und die BESCHREIBUNGEN
+#     der vorhandenen Spalten angeglichen (jede Spalte hat eine Beschreibung:
+#     wofür sie ist, wer sie schreibt, wo sie verwendet wird). In
+#     Auswahlspalten werden fehlende Werte ergänzt. Sonst bleiben vorhandene
+#     Spalten, Einträge und Einstellungen unangetastet, es wird nichts
+#     gelöscht, entfernt oder umbenannt.
+#
+# Trockenlauf (dryRun = true, Standard): Die Pipeline liest nur und zeigt im
+# Log, was sie anlegen würde. Erst mit dryRun = false wird etwas geschrieben.
+#
+# Zweck der Listen:
+#   Environments: Register aller Umgebungen (Name, ID, URL, Typ, Managed,
+#     Owner) als Grundlage für Deployment-Ziele, außerdem Arbeitsliste für die
+#     Änderung bei unmanaged Developer-Umgebungen (Handlungsbedarf, Maßnahme).
+#   Solutions: eine Zeile pro Solution und Umgebung: eigene (unmanaged),
+#     managed (außer denen von Microsoft) und die Standard-Solution. Bei managed
+#     Solutions zeigt "Quelle", ob es irgendwo die unmanaged Quelle gibt. Der Publisher ist über
+#     den Prefix eindeutig. "Inhalt" listet die Objekte der Solution (Flows,
+#     Apps, Tabellen ...), "Inhalt (JSON)" dieselben Daten für die Power App.
+#     Die Spalte "Sicherungsentscheidung" wählt aus, was später ins Repo
+#     exportiert wird (Offen, Sichern, Nicht sichern).
+#
+# Wer schreibt welche Spalte?
+#   Pipeline (inventory.yml, ab Stufe 2): alles, was nicht unter "Menschen"
+#     steht. Das Backup (später) schreibt BackupStatus, LastBackup, BackupCommit.
+#   Menschen (später auch die Power App):
+#     Environments: AccessDecision (Zugriffsentscheidung), Measure, EnvRole, Notes
+#     Solutions:    BackupDecision (Sicherungsentscheidung), Notes
+#   Hinweis: Die früheren Spalten GrantAccess ("Zugriff freigeben") und
+#   BackupRequested ("Sichern") werden nicht mehr angelegt und nicht mehr
+#   beschrieben. In vorhandenen Listen können sie manuell gelöscht werden.
+#   Die Pipeline überschreibt die Spalten der Menschen nie.
+#
+# Der Titel (Spalte "Title") enthält den Namen der Umgebung bzw. den
+# Anzeigenamen der Solution.
+#
+# Voraussetzungen (Variable Group):
+#   TenantId, ClientId, ClientSecret der App Registration und SiteId der
+#   SharePoint-Site (zusammengesetzte ID: {hostname},{site-collection-guid},
+#   {web-guid}). Die App braucht auf der Site Sites.Selected mit Schreibrecht.
+#   Für das Anlegen einer Liste reicht Write wahrscheinlich, sonst ist Manage
+#   oder Owner nötig. Bei 403 meldet die Pipeline das im Log.
+# =============================================================================
+
+trigger: none
+
+parameters:
+  - name: variableGroup
+    displayName: Variable Group (Zugangsdaten und SiteId)
+    type: string
+    default: Inventory-Secrets
+
+  # true = nur anzeigen, was angelegt würde
+  - name: dryRun
+    displayName: Trockenlauf (nichts anlegen)
+    type: boolean
+    default: true
+
+  - name: createEnvironments
+    displayName: Liste Environments anlegen bzw. ergänzen
+    type: boolean
+    default: true
+
+  - name: createSolutions
+    displayName: Liste Solutions anlegen bzw. ergänzen
+    type: boolean
+    default: true
+
+  - name: environmentsListName
+    displayName: Name der Liste Environments
+    type: string
+    default: Environments
+
+  - name: solutionsListName
+    displayName: Name der Liste Solutions
+    type: string
+    default: Solutions
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: ${{ parameters.variableGroup }}
+
+steps:
+  - task: PowerShell@2
+    displayName: Listen anlegen bzw. ergänzen
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $dryRun  = [System.Convert]::ToBoolean("${{ parameters.dryRun }}")
+        $doEnv   = [System.Convert]::ToBoolean("${{ parameters.createEnvironments }}")
+        $doSol   = [System.Convert]::ToBoolean("${{ parameters.createSolutions }}")
+        $envName = "${{ parameters.environmentsListName }}"
+        $solName = "${{ parameters.solutionsListName }}"
+        Write-Host "Trockenlauf: $dryRun, Environments: $doEnv ('$envName'), Solutions: $doSol ('$solName')"
+
+        # Liefert den Text eines Fehlers inklusive Antworttext des Servers
+        function Get-ErrorText {
+            param($ErrorRecord)
+            $text = $ErrorRecord.Exception.Message
+            if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+                $text += " | " + $ErrorRecord.ErrorDetails.Message
+            }
+            if ($text.Length -gt 800) { $text = $text.Substring(0, 800) + " ..." }
+            return $text
+        }
+
+        function Get-HttpStatus {
+            param($ErrorRecord)
+            try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch { return 0 }
+        }
+
+        # Holt alle Seiten einer Graph-Abfrage (@odata.nextLink)
+        function Get-AllPages {
+            param([string]$Uri, [hashtable]$Headers)
+            $all = [System.Collections.Generic.List[object]]::new()
+            while ($Uri) {
+                $page = Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers
+                if ($page.value) { $all.AddRange([object[]]@($page.value)) }
+                $Uri = $page.'@odata.nextLink'
+            }
+            return $all
+        }
+
+        # Baut eine Spaltendefinition im Graph-Format.
+        #   Name    = interner Name (ohne Umlaute und Leerzeichen, bleibt dauerhaft)
+        #   Display = Anzeigename in der Liste (darf Umlaute enthalten)
+        #   Kind    = text | multiline | number | datetime | boolean | choice
+        #   Desc    = Beschreibung der Spalte (in der Listeneinstellung sichtbar):
+        #             wofür die Spalte ist, wer sie schreibt, wo sie verwendet wird
+        function New-Col {
+            param(
+                [string]$Name, [string]$Display, [string]$Kind,
+                [string[]]$Choices, [string]$Default, [string]$Desc, [switch]$Indexed
+            )
+            $c = [ordered]@{ name = $Name; displayName = $Display }
+            if ($Desc) { $c.description = $Desc }
+            switch ($Kind) {
+                'text'      { $c.text = @{} }
+                # Nur Text, KEIN Rich Text (wie beim Log in der Onboarding-Liste)
+                'multiline' { $c.text = @{ allowMultipleLines = $true; textType = 'plain'; linesForEditing = 6 } }
+                'number'    { $c.number = @{ decimalPlaces = 'none' } }
+                'datetime'  { $c.dateTime = @{ displayAs = 'default'; format = 'dateTime' } }
+                'boolean'   { $c.boolean = @{} }
+                'choice'    { $c.choice = @{ allowTextEntry = $false; choices = $Choices; displayAs = 'dropDownMenu' } }
+            }
+            if ($Default) { $c.defaultValue = @{ value = $Default } }
+            # Indizierte Spalten kann man später ohne den Prefer-Header filtern
+            if ($Indexed) { $c.indexed = $true }
+            return $c
+        }
+
+        # ---------------------------------------------------------------
+        # Spalten der Liste Environments
+        # Jede Spalte hat eine Beschreibung: wofür sie ist, wer sie schreibt
+        # (Pipeline = inventory.yml, Mensch = Menschen und die Power App,
+        # Backup = backup.yml, später) und wo sie verwendet wird.
+        # ---------------------------------------------------------------
+        $envColumns = @(
+            # --- Von der Pipeline gepflegt ---
+            (New-Col 'EnvironmentId'    'Umgebungs-ID'      'text' -Indexed -Desc 'Pipeline. Technische ID der Umgebung (GUID aus der Admin API). Schlüssel dieser Liste und Verbindung zur Liste Solutions.'),
+            (New-Col 'EnvType'          'Typ'               'choice' -Choices @('Developer','Trial','Sandbox','Production','Default','Teams','Sonstige') -Desc 'Pipeline. Umgebungstyp laut Admin API. Developer-Umgebungen, die nicht managed sind, werden gesperrt (15.12.2026) und gelöscht (15.01.2027).'),
+            (New-Col 'IsManaged'        'Managed'           'choice' -Choices @('Ja','Nein','Unbekannt') -Desc 'Pipeline. Ist die Umgebung eine Managed Environment? Unbekannt, wenn die Admin API es nicht liefert. Unmanaged Developer-Umgebungen lösen den Handlungsbedarf aus.'),
+            (New-Col 'InstanceUrl'      'Umgebungs-URL'     'text' -Desc 'Pipeline. Dataverse-URL der Umgebung. Leer, wenn die Umgebung kein Dataverse hat. Wird für den Zugriff auf Solutions benutzt.'),
+            (New-Col 'OwnerUpn'         'Owner'             'text' -Desc 'Pipeline. Owner der Umgebung (Name und UPN, über Microsoft Graph aufgelöst). Fehlt die Graph-Berechtigung User.Read.All, steht hier der Ersteller.'),
+            (New-Col 'CreatedOn'        'Erstellt am'       'datetime' -Desc 'Pipeline. Erstelldatum der Umgebung laut Admin API.'),
+            (New-Col 'HasDataverse'     'Dataverse'         'choice' -Choices @('Ja','Nein') -Desc 'Pipeline. Hat die Umgebung Dataverse? Nur dann liest die Pipeline Solutions, Apps und Flows. Umgebungen ohne Dataverse sind noch nicht abgedeckt (geplant).'),
+            (New-Col 'AccessState'      'Zugriff'           'choice' -Choices @('OK','Kein Zugriff','Fehler','Kein Dataverse') -Desc 'Pipeline. Kann die App in die Dataverse-Umgebung hineinsehen? Bei Kein Zugriff fehlt der Application User, siehe Zugriffsentscheidung.'),
+            (New-Col 'AccessLog'        'Zugriff-Log'       'multiline' -Desc 'Pipeline. Letzte Meldung zum Zugriff mit Zeitstempel: fehlender Application User, Fehlertext oder Hinweis, dass der Application User angelegt wurde.'),
+            (New-Col 'OwnSolutionCount' 'Eigene Solutions'  'number' -Desc 'Pipeline. Anzahl der eigenen (unmanaged) Solutions. Leer, wenn kein Zugriff besteht.'),
+            (New-Col 'LooseObjectCount' 'Lose Objekte'      'number' -Desc 'Pipeline. Anzahl der Cloud Flows, Canvas Apps und eigenen Tabellen, die in keiner echten Solution liegen. Die Standard-Solution und die System-Solutions zählen nicht als Solution. Leer ohne Zugriff.'),
+            (New-Col 'LooseObjects'     'Lose Objekte (Namen)' 'multiline' -Desc 'Pipeline. Namen der losen Objekte, eine Zeile je Typ (Flows, Apps, Tabellen), höchstens 25 Namen je Typ.'),
+            (New-Col 'ActionRequired'   'Handlungsbedarf'   'text' -Desc 'Pipeline. Was die Pipeline als offen erkennt: unmanaged Developer-Umgebung, fehlende Zugriffsentscheidung, Umgebung nicht mehr vorhanden. Eigene Maßnahmen gehören in die Spalte Maßnahme.'),
+            (New-Col 'IsPresent'        'Vorhanden'         'boolean' -Default 'true' -Desc 'Pipeline. Nein, wenn die Umgebung nicht mehr in der Admin API steht. Die Zeile bleibt dann stehen.'),
+            (New-Col 'LastSeen'         'Zuletzt gesehen'   'datetime' -Desc 'Pipeline. Zeitpunkt des letzten Laufs, in dem die Umgebung gesehen wurde.'),
+            # --- Von Menschen gepflegt (die Pipeline schreibt sie nie) ---
+            (New-Col 'AccessDecision'   'Zugriffsentscheidung' 'choice' -Choices @('Offen','Freigeben','Nicht freigeben','Freigegeben') -Desc 'Mensch, mit Rückmeldung der Pipeline. Offen: setzt die Pipeline, wenn der Zugriff fehlt. Freigeben: der nächste Lauf legt den Application User an (verändert die Umgebung). Freigegeben: setzt die Pipeline, sobald der Zugriff steht. Nicht freigeben: wird nicht erneut gefragt.'),
+            (New-Col 'Measure'          'Maßnahme'          'choice' -Choices @('Offen','Wird gesichert','Wird ersetzt','Nicht mehr benötigt','Erledigt') -Default 'Offen' -Desc 'Mensch. Geplante Maßnahme für die Umgebung, zum Beispiel bei unmanaged Developer-Umgebungen. Die Pipeline schreibt hier nie.'),
+            (New-Col 'EnvRole'          'Rolle'             'choice' -Choices @('Dev','Test','Prod','Sonstige') -Desc 'Mensch. Rolle der Umgebung im Deployment-Weg. Grundlage für das spätere Deployment-Register. Die Pipeline schreibt hier nie.'),
+            (New-Col 'Notes'            'Notiz'             'multiline' -Desc 'Mensch. Freie Notiz. Die Pipeline schreibt hier nie.')
+        )
+
+        # ---------------------------------------------------------------
+        # Spalten der Liste Solutions (Title = Anzeigename der Solution)
+        # ---------------------------------------------------------------
+        $solColumns = @(
+            # --- Von der Pipeline gepflegt ---
+            (New-Col 'UniqueName'       'Eindeutiger Name'  'text' -Desc 'Pipeline. Eindeutiger Name der Solution. Zusammen mit der Umgebungs-ID der Schlüssel dieser Liste. Die Anzeigenamen sind je nach Sprache der Umgebung verschieden.'),
+            (New-Col 'EnvironmentId'    'Umgebungs-ID'      'text' -Indexed -Desc 'Pipeline. ID der Umgebung, in der die Solution liegt. Verbindung zur Liste Environments.'),
+            (New-Col 'EnvironmentName'  'Umgebung'          'text' -Desc 'Pipeline. Name der Umgebung, in der die Solution liegt.'),
+            (New-Col 'SolutionVersion'  'Version'           'text' -Desc 'Pipeline. Version der Solution in dieser Umgebung. Dev, Test und Prod dürfen unterschiedliche Stände haben.'),
+            (New-Col 'Publisher'        'Publisher'         'text' -Desc 'Pipeline. Anzeigename des Publishers der Solution.'),
+            (New-Col 'PublisherPrefix'  'Prefix'            'text' -Indexed -Desc 'Pipeline. Prefix des Publishers. Eindeutiger als der Name, wird auch für die Quelle-Suche benutzt. Der Prefix msdyn (Microsoft) wird ausgeblendet.'),
+            (New-Col 'IsManaged'        'Managed'           'choice' -Choices @('Ja','Nein') -Desc 'Pipeline. Ist die Solution in dieser Umgebung managed?'),
+            (New-Col 'SolutionKind'     'Art'               'choice' -Choices @('Eigene','Managed','Standard','System') -Desc 'Pipeline. Eigene = unmanaged. Managed = ohne Microsoft. Standard = Common Data Services Default Solution, in der lose Objekte landen. System kommt nicht mehr in die Liste.'),
+            (New-Col 'SourceState'      'Quelle'            'choice' -Choices @('Gefunden','Keine gefunden','Nicht prüfbar') -Desc 'Pipeline, nur bei managed Solutions. Gefunden: es gibt irgendwo eine unmanaged Solution mit gleichem Namen und Prefix. Keine gefunden: von außen importiert, es braucht den Export der managed Solution. Nicht prüfbar: Umgebungen ohne Zugriff könnten die Quelle enthalten.'),
+            (New-Col 'SourceEnvironments' 'Quelle in'       'text' -Desc 'Pipeline, nur bei managed Solutions. Umgebung(en) mit der unmanaged Quelle und Version, bei Handlungsbedarf mit Hinweis. Bei Nicht prüfbar die Zahl der Umgebungen ohne Zugriff.'),
+            (New-Col 'SolutionContent'  'Inhalt'            'multiline' -Desc 'Pipeline. Objekte der Solution, eine Zeile je Typ (Flows, Canvas Apps, Model-driven Apps, Umgebungsvariablen, Connection References, Tabellen, Sonstige als Anzahl), höchstens 25 Namen je Typ. Wird bei jedem Lauf neu geschrieben, eigene Anmerkungen gehören in Notiz.'),
+            (New-Col 'SolutionContentJson' 'Inhalt (JSON)'  'multiline' -Desc 'Pipeline. Derselbe Inhalt vollständig als JSON, für die Power App (ParseJSON). In der Listenansicht ausblenden.'),
+            (New-Col 'ActionRequired'   'Hinweis'           'text' -Desc 'Pipeline. Hinweis zur Sicherung: Sicherung entscheiden (eigene Solution) oder keine unmanaged Quelle gefunden (managed). Verschwindet, sobald eine Entscheidung steht.'),
+            (New-Col 'IsPresent'        'Vorhanden'         'boolean' -Default 'true' -Desc 'Pipeline. Nein, wenn die Solution nicht mehr in der Umgebung gefunden wurde. Die Zeile bleibt dann stehen.'),
+            (New-Col 'LastSeen'         'Zuletzt gesehen'   'datetime' -Desc 'Pipeline. Zeitpunkt des letzten Laufs, in dem die Solution gesehen wurde.'),
+            # --- Von Menschen gepflegt (die Pipeline schreibt sie nie) ---
+            (New-Col 'BackupDecision'   'Sicherungsentscheidung' 'choice' -Choices @('Offen','Sichern','Nicht sichern') -Desc 'Mensch. Soll die Solution gesichert werden? Offen setzt die Pipeline bei eigenen Solutions und bei managed Solutions ohne Quelle. Sichern: das spätere Backup exportiert sie ins Repo.'),
+            (New-Col 'Notes'            'Notiz'             'multiline' -Desc 'Mensch. Freie Notiz. Die Pipeline schreibt hier nie.'),
+            # --- Vom Backup geschrieben (später) ---
+            (New-Col 'BackupStatus'     'Backup-Status'     'choice' -Choices @('Nicht gesichert','Erfolgreich','Fehler') -Default 'Nicht gesichert' -Desc 'Backup (backup.yml, später). Ergebnis der letzten Sicherung. Noch ohne Funktion.'),
+            (New-Col 'LastBackup'       'Letztes Backup'    'datetime' -Desc 'Backup (backup.yml, später). Zeitpunkt der letzten erfolgreichen Sicherung. Noch ohne Funktion.'),
+            (New-Col 'BackupCommit'     'Commit-Link'       'text' -Desc 'Backup (backup.yml, später). Link auf den Commit mit dem Export im Repo. Noch ohne Funktion.')
+        )
+
+        # Legt eine Liste an oder ergänzt fehlende Spalten
+        function Ensure-List {
+            param([string]$ListName, $Columns)
+            Write-Host ""
+            Write-Host "=== Liste '$ListName' ==="
+            $existing = $script:lists | Where-Object { $_.displayName -eq $ListName } | Select-Object -First 1
+
+            if (-not $existing) {
+                Write-Host "Liste '$ListName' existiert nicht."
+                if ($dryRun) {
+                    Write-Host "Trockenlauf: würde die Liste mit $($Columns.Count) Spalten anlegen:"
+                    $Columns | ForEach-Object { Write-Host "   - $($_.name) ($($_.displayName))" }
+                }
+                else {
+                    $body = [ordered]@{
+                        displayName = $ListName
+                        list        = @{ template = 'genericList' }
+                        columns     = $Columns
+                    } | ConvertTo-Json -Depth 10
+                    $created = Invoke-RestMethod -Method Post -Uri "$siteUri/lists" -Headers $h `
+                      -Body $body -ContentType "application/json"
+                    Write-Host "Liste angelegt: '$ListName' (ID $($created.id)) mit $($Columns.Count) Spalten."
+                    Write-Host "Link: $($created.webUrl)"
+                }
+            }
+            else {
+                Write-Host "Liste '$ListName' existiert (ID $($existing.id)). Prüfe fehlende Spalten ..."
+                $haveCols = @(Get-AllPages "$siteUri/lists/$($existing.id)/columns?`$select=id,name,description,choice" $h)
+                $have = @($haveCols | ForEach-Object { ([string]$_.name).ToLower() })
+                $missing = @($Columns | Where-Object { $have -notcontains ([string]$_.name).ToLower() })
+                if ($missing.Count -eq 0) {
+                    Write-Host "Alle $($Columns.Count) Spalten sind vorhanden."
+                }
+                # Beschreibungen vorhandener Spalten angleichen (nur die Beschreibung,
+                # sonst bleibt die Spalte unverändert)
+                $nDesc = 0
+                foreach ($col in $Columns) {
+                    $cur = $haveCols | Where-Object { ([string]$_.name).ToLower() -eq ([string]$col.name).ToLower() } | Select-Object -First 1
+                    if (-not $cur -or -not $col.description) { continue }
+                    if (([string]$cur.description).Trim() -eq ([string]$col.description).Trim()) { continue }
+                    if ($dryRun) {
+                        Write-Host "Trockenlauf: würde Beschreibung aktualisieren: $($col.name)"
+                    }
+                    else {
+                        Invoke-RestMethod -Method Patch -Uri "$siteUri/lists/$($existing.id)/columns/$($cur.id)" -Headers $h `
+                          -Body (@{ description = [string]$col.description } | ConvertTo-Json) -ContentType "application/json; charset=utf-8" | Out-Null
+                        Write-Host "Beschreibung aktualisiert: $($col.name)"
+                    }
+                    $nDesc++
+                }
+                # Fehlen in einer Auswahlspalte Werte (z. B. ein neuer Status), werden
+                # sie angehängt. Vorhandene Werte bleiben, nichts wird entfernt.
+                $nChoice = 0
+                foreach ($col in $Columns) {
+                    if (-not $col.choice) { continue }
+                    $cur = $haveCols | Where-Object { ([string]$_.name).ToLower() -eq ([string]$col.name).ToLower() } | Select-Object -First 1
+                    if (-not $cur -or -not $cur.choice) { continue }
+                    $curChoices = @($cur.choice.choices)
+                    $newOnes = @($col.choice.choices | Where-Object { $curChoices -notcontains $_ })
+                    if ($newOnes.Count -eq 0) { continue }
+                    if ($dryRun) {
+                        Write-Host "Trockenlauf: würde Auswahlwerte ergänzen bei $($col.name): $($newOnes -join ', ')"
+                    }
+                    else {
+                        $body = @{ choice = @{
+                            allowTextEntry = [bool]$cur.choice.allowTextEntry
+                            choices        = @($curChoices + $newOnes)
+                            displayAs      = [string]$cur.choice.displayAs
+                        } } | ConvertTo-Json -Depth 5
+                        Invoke-RestMethod -Method Patch -Uri "$siteUri/lists/$($existing.id)/columns/$($cur.id)" -Headers $h `
+                          -Body $body -ContentType "application/json; charset=utf-8" | Out-Null
+                        Write-Host "Auswahlwerte ergänzt: $($col.name): $($newOnes -join ', ')"
+                    }
+                    $nChoice++
+                }
+                if ($missing.Count -eq 0 -and $nDesc -eq 0 -and $nChoice -eq 0) { Write-Host "Nichts zu tun." }
+                foreach ($col in $missing) {
+                    if ($dryRun) {
+                        Write-Host "Trockenlauf: würde Spalte ergänzen: $($col.name) ($($col.displayName))"
+                    }
+                    else {
+                        Invoke-RestMethod -Method Post -Uri "$siteUri/lists/$($existing.id)/columns" -Headers $h `
+                          -Body ($col | ConvertTo-Json -Depth 10) -ContentType "application/json" | Out-Null
+                        Write-Host "Spalte ergänzt: $($col.name) ($($col.displayName))"
+                    }
+                }
+            }
+        }
+
+        if (-not $doEnv -and -not $doSol) {
+            Write-Host "Keine Liste ausgewählt. Nichts zu tun."
+            exit 0
+        }
+
+        try {
+            $tokenResponse = Invoke-RestMethod -Method Post `
+              -Uri "https://login.microsoftonline.com/$(TenantId)/oauth2/v2.0/token" `
+              -Body @{
+                client_id     = "$(ClientId)"
+                client_secret = "$(ClientSecret)"
+                scope         = "https://graph.microsoft.com/.default"
+                grant_type    = "client_credentials"
+              }
+            $h = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
+            $siteUri = "https://graph.microsoft.com/v1.0/sites/$(SiteId)"
+
+            # Vorhandene Listen einmal lesen, Vergleich über den Anzeigenamen
+            $script:lists = @(Get-AllPages "$siteUri/lists?`$select=id,displayName" $h)
+
+            if ($doEnv) { Ensure-List $envName $envColumns }
+            if ($doSol) { Ensure-List $solName $solColumns }
+        }
+        catch {
+            $status = Get-HttpStatus $_
+            Write-Host "##[error]$(Get-ErrorText $_)"
+            if ($status -eq 403 -or $status -eq 401) {
+                Write-Host "##[error]Kein ausreichender Zugriff auf die Site. Die App braucht Sites.Selected mit Write-Recht, zum Anlegen von Listen eventuell Manage oder Owner."
+            }
+            elseif ($status -eq 404) {
+                Write-Host "##[error]Site nicht gefunden. SiteId in der Variable Group prüfen (Format: hostname,site-collection-guid,web-guid)."
+            }
+            exit 1
+        }

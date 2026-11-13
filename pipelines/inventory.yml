@@ -1,0 +1,1233 @@
+# =============================================================================
+# inventory.yml
+# Inventarisiert alle Power-Platform-Umgebungen eines Tenants:
+#   - Typ (Developer, Trial, Sandbox, Production, Default, Teams), Managed ja/nein
+#   - Ersteller, Erstelldatum und ein Risiko-Hinweis
+#     (unmanaged Developer-Umgebungen: Sperre 15.12.2026, Löschung 15.01.2027)
+#   - Solutions je Umgebung (eigene = unmanaged, plus Anzahl managed)
+#   - Anzahl und Namen "loser" Objekte: Cloud Flows, Canvas Apps und eigene
+#     Tabellen, die in KEINER Solution liegen (die Default Solution zählt nicht
+#     als Solution, denn dort landet in neuen Umgebungen alles standardmäßig)
+#
+# Ergebnis: Pipeline-Log, Artefakt "inventory" (inventory.json) und, mit
+# writeToLists = true (Standard), zwei SharePoint-Listen: "Environments" (eine
+# Zeile pro Umgebung) und "Solutions" (eine Zeile pro Solution und Umgebung),
+# bei jedem Lauf aktualisiert. Es wird nichts exportiert.
+# Verändert wird nur zweierlei: die Pipeline-Spalten der Liste (die Spalten der
+# Menschen fasst die Pipeline nie an, nur die Entscheidungsspalten setzt sie
+# einmalig auf "Offen", solange die Zelle leer ist) und, wenn ein Mensch in der
+# Liste "Freigeben" gewählt hat, die Umgebung (Application User, siehe unten).
+#
+# Der Ablauf pro Lauf:
+#   1. Token für die Power Platform Admin API (BAP) holen, alle Umgebungen lesen
+#   2. Je Umgebung mit Dataverse: Token für die Umgebung holen, Solutions und
+#      Komponenten per Dataverse Web API lesen und lose Objekte berechnen
+#   3. Log-Ausgabe, Zusammenfassungstabelle und inventory.json
+#   4. Listen pflegen (writeToLists): neue Zeilen anlegen, vorhandene
+#      aktualisieren, verschwundene als "nicht vorhanden" markieren
+#
+# Liste "Solutions": Schlüssel ist Umgebungs-ID + eindeutiger Name. Aufgenommen
+# werden die eigenen (unmanaged) Solutions, die managed Solutions, die nicht von
+# Microsoft stammen, und die automatisch angelegte Standard-Solution ("Common
+# Data Services Default Solution"). Nicht aufgenommen werden die managed
+# Solutions von Microsoft (Parameter ignorePrefixes, Standard "msdyn", außerdem
+# Publisher-Name Microsoft / Dynamics 365) und die System-Solutions Default,
+# Active und Basic. Sie stehen weiter im Log und in inventory.json. Die Spalte
+# "Art" unterscheidet Eigene, Managed und Standard. Verschwindet eine Solution
+# aus einer Umgebung, auf die die Pipeline zugreifen konnte, oder die Umgebung
+# selbst, wird die Zeile mit "Vorhanden" = Nein markiert. Umgebungen ohne
+# Zugriff bleiben unverändert, denn dort ist nicht bekannt, was in ihnen liegt.
+#
+# Inhalt: "Inhalt" (Text, eine Zeile je Typ: Flows, Canvas Apps, Model-driven
+# Apps, Umgebungsvariablen, Connection References, Tabellen, Sonstige als
+# Anzahl, höchstens 25 Namen je Typ) und "Inhalt (JSON)" (alle Namen, für die
+# Power App). Die Standard-Solution fängt die meisten losen Objekte ab.
+#
+# Quelle (nur managed Solutions): Die Pipeline sucht in allen lesbaren
+# Umgebungen eine eigene (unmanaged) Solution mit gleichem eindeutigen Namen und
+# gleichem Publisher-Prefix. "Quelle" = Gefunden (dann steht in "Quelle in" die
+# Umgebung mit Version), Keine gefunden (die Solution wurde von außen importiert,
+# für eine Neu-Installation braucht man den Export der managed Solution) oder
+# Nicht prüfbar (es gibt Umgebungen ohne Zugriff, die die Quelle enthalten
+# könnten). Liegt die Quelle in einer Umgebung mit Handlungsbedarf (z. B. einer
+# unmanaged Developer-Umgebung), steht das dabei.
+#
+# Sicherungsentscheidung (Offen, Sichern, Nicht sichern) gehört den Menschen.
+# Die Pipeline setzt sie einmalig auf "Offen" und schreibt einen Hinweis bei
+# eigenen Solutions und bei managed Solutions ohne gefundene Quelle.
+#
+# Alte Zeilen: Zeilen mit Art "System" oder mit einem Prefix aus ignorePrefixes
+# aus früheren Läufen fasst die Pipeline nicht mehr an. Sie lassen sich in der
+# Liste löschen (filtern, alle auswählen, löschen).
+#
+# Verschwundene Umgebungen: Steht eine Umgebung nicht mehr in der Admin API,
+# bleibt ihre Zeile erhalten ("Vorhanden" = Nein, "Zuletzt gesehen" bleibt auf
+# dem letzten Lauf). Das passiert nur, wenn der Abruf geklappt hat, mindestens
+# eine Umgebung geliefert wurde und kein Namensfilter gesetzt ist.
+#
+# Owner: Die Admin API liefert die Objekt-ID des Nutzers (usedBy.id). Sie wird
+# über Microsoft Graph in Name und UPN aufgelöst. Gelingt das nicht, steht der
+# Ersteller in der Spalte.
+#
+# Mandantenfähig: Alle Zugangsdaten stammen aus einer Variable Group. Für einen
+# anderen Tenant eine Variable Group mit denselben Variablennamen anlegen und
+# beim Start den Parameter variableGroup setzen.
+#
+# Voraussetzungen (Variable Group):
+#   TenantId, ClientId, ClientSecret der App Registration. Die App hat die
+#   Rolle "Power Platform Administrator" und ist als Power-Platform-Management-
+#   App registriert (wie für pac admin create in onboarding.yml).
+#   Für die Liste (writeToLists): SiteId der SharePoint-Site (zusammengesetzt:
+#   hostname,site-collection-guid,web-guid). Die Listen legt setup-lists.yml
+#   an. Die App braucht auf der Site Sites.Selected mit Schreibrecht (write).
+#   Ohne die Liste (writeToLists = false) gibt es keine Zugriffsentscheidung.
+#   Für den Owner: Graph-Berechtigung User.Read.All (Application, mit
+#   Admin-Zustimmung). Fehlt sie, wird der Ersteller eingetragen.
+#
+# Zugriff auf die Solutions (Application User):
+#   Die Umgebungsliste braucht nur die Admin-Rolle. Um in eine Umgebung
+#   hineinzusehen, braucht die App Registration dort zusätzlich einen
+#   Application User. Fehlt er, meldet das Inventar "kein Zugriff", setzt in
+#   der Liste die Zugriffsentscheidung auf "Offen" und trägt eine Maßnahme ein.
+#   Ein Mensch wählt dann in der Liste:
+#     Freigeben        beim nächsten Lauf legt die Pipeline den Application User
+#                      (Rolle System Administrator) über die Admin API
+#                      (addAppUser) an. Das verändert die Umgebung und
+#                      geschieht nur auf diese ausdrückliche Wahl. Steht der
+#                      Zugriff, setzt die Pipeline die Entscheidung auf
+#                      "Freigegeben".
+#     Freigegeben      (setzt die Pipeline) der Zugriff besteht. Geht er später
+#                      verloren, setzt die Pipeline wieder "Offen".
+#     Nicht freigeben  die Umgebung bleibt unberührt und es wird nicht erneut
+#                      nachgefragt.
+#
+# Was noch NICHT geprüft ist (beim ersten Lauf im Log beobachten):
+#   - Feldnamen der Admin API: environmentSku, governanceConfiguration.
+#     protectionLevel (Standard = managed, Basic = unmanaged), createdBy.
+#     Beim ersten Lauf bestätigt. Mit dumpRaw = true steht die Rohantwort der
+#     ersten Umgebung im Log, falls bei einem anderen Tenant etwas "unbekannt"
+#     bleibt.
+#   - Komponententypen in solutioncomponent: 1 = Tabelle, 29 = Workflow
+#     (Cloud Flow), 300 = Canvas App.
+#
+# Grenzen:
+#   - Copilot-Studio-Agents, Umgebungsvariablen, Connection References und
+#     Apps, die in keiner Solution liegen, stehen nicht in Dataverse. Sie werden
+#     zusätzlich über die Admin API von Power Apps gelesen (Token für
+#     https://service.powerapps.com). Schlägt das fehl, gibt es eine Warnung und
+#     die lose Apps sind unvollständig.
+#     benutzerdefinierte Connectoren werden noch nicht auf lose Objekte geprüft
+#     (im Inhalt der Solutions erscheinen Umgebungsvariablen und Connection
+#     References, Agents und Connectoren nur als Anzahl bzw. "Typ n").
+#   - Umgebungen ohne Dataverse: nur Umgebungsdaten (Spalte "Dataverse" = Nein).
+#     Apps und Flows liegen dort im Speicher des Power-Apps-Dienstes, nicht in
+#     Solutions, und werden noch nicht erfasst. Geplant: Abfrage über die
+#     Admin-APIs von Power Apps und Power Automate (vorher prüfen, ob die App
+#     Registration dort lesen darf).
+#   - Daten in Tabellen sind nicht Teil des Inventars.
+# =============================================================================
+
+trigger: none
+
+parameters:
+  # Name der Variable Group mit TenantId, ClientId, ClientSecret
+  - name: variableGroup
+    displayName: Variable Group (Zugangsdaten des Tenants)
+    type: string
+    default: Inventory-Secrets
+
+  # true = Ergebnis in die SharePoint-Liste schreiben (braucht SiteId in der
+  # Variable Group und die Liste aus setup-lists.yml)
+  - name: writeToLists
+    displayName: Ergebnis in die SharePoint-Liste schreiben
+    type: boolean
+    default: true
+
+  - name: environmentsListName
+    displayName: Name der Liste Environments
+    type: string
+    default: Environments
+
+  - name: solutionsListName
+    displayName: Name der Liste Solutions
+    type: string
+    default: Solutions
+
+  # Managed Solutions von Microsoft kommen nicht in die Liste Solutions. Erkannt
+  # werden sie am Publisher-Prefix (kommagetrennt) und am Publisher-Namen
+  # (beginnt mit Microsoft oder Dynamics 365). "keine" schaltet die Prefix-Liste ab.
+  - name: ignorePrefixes
+    displayName: Publisher-Prefixe, die ausgeblendet werden (kommagetrennt)
+    type: string
+    default: 'msdyn'
+
+  # Optional: nur Umgebungen, deren Anzeigename diesen Text enthält (zum Testen)
+  - name: environmentFilter
+    displayName: Umgebungsfilter - Namensteil, oder "alle" für keine Einschränkung
+    type: string
+    default: 'alle'
+
+  # true = Rohantwort der Admin API für die erste Umgebung ins Log schreiben
+  - name: dumpRaw
+    displayName: Rohdaten der ersten Umgebung ins Log
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: ${{ parameters.variableGroup }}
+
+steps:
+  - task: PowerShell@2
+    displayName: Umgebungen und Solutions inventarisieren
+    env:
+      P_DUMP_RAW: ${{ parameters.dumpRaw }}
+      P_ENV_FILTER: ${{ parameters.environmentFilter }}
+      P_IGNORE_PREFIXES: ${{ parameters.ignorePrefixes }}
+      P_WRITE_TO_LISTS: ${{ parameters.writeToLists }}
+      P_ENV_LIST_NAME: ${{ parameters.environmentsListName }}
+      P_SOL_LIST_NAME: ${{ parameters.solutionsListName }}
+    inputs:
+      targetType: inline
+      pwsh: true   # PowerShell 7 auf dem Linux-Agent
+      script: |
+        # Die Parameter kommen als Umgebungsvariablen (siehe env: am Task). Im
+        # Skript stehen bewusst keine Template-Ausdrücke (Dollarzeichen mit
+        # doppelten geschweiften Klammern): Azure DevOps wertet einen Textblock mit
+        # solchen Ausdrücken beim Einlesen aus und lehnt ihn ab, wenn er länger
+        # als 21000 Zeichen ist ("Exceeded max expression length").
+        $dumpRaw     = [System.Convert]::ToBoolean($env:P_DUMP_RAW)
+        $envFilter   = [string]$env:P_ENV_FILTER
+        $ignorePrefixes = @(([string]$env:P_IGNORE_PREFIXES) -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ -and $_ -ne 'keine' })
+        $writeToLists = [System.Convert]::ToBoolean($env:P_WRITE_TO_LISTS)
+        $envListName = [string]$env:P_ENV_LIST_NAME
+        $solListName = [string]$env:P_SOL_LIST_NAME
+        $hadIssues   = $false
+        $script:contentWarnings = @()
+        $script:appApiWarnings  = @()
+        $script:ppToken = $null
+        Write-Host "Namensfilter: '$envFilter', in Liste schreiben: $writeToLists ('$envListName', '$solListName')"
+
+        # ---------------------------------------------------------------
+        # Hilfsfunktionen
+        # ---------------------------------------------------------------
+
+        # Holt ein Token per Client Credentials für die angegebene Ressource.
+        # Scope-Beispiele: https://api.bap.microsoft.com/.default (Admin API),
+        # https://<org>.crm4.dynamics.com/.default (Dataverse einer Umgebung)
+        function Get-Token {
+            param([string]$Scope)
+            $r = Invoke-RestMethod -Method Post `
+              -Uri "https://login.microsoftonline.com/$(TenantId)/oauth2/v2.0/token" `
+              -Body @{
+                client_id     = "$(ClientId)"
+                client_secret = "$(ClientSecret)"
+                scope         = $Scope
+                grant_type    = "client_credentials"
+              }
+            return $r.access_token
+        }
+
+        # Liefert den Text eines Fehlers inklusive Antworttext des Servers.
+        # In PowerShell 7 steht der Antworttext nicht in der Exception-Message,
+        # sondern in ErrorDetails.
+        function Get-ErrorText {
+            param($ErrorRecord)
+            $text = $ErrorRecord.Exception.Message
+            if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+                $text += " | " + $ErrorRecord.ErrorDetails.Message
+            }
+            if ($text.Length -gt 600) { $text = $text.Substring(0, 600) + " ..." }
+            return $text
+        }
+
+        # HTTP-Statuscode eines Fehlers (0, wenn keiner vorhanden ist)
+        function Get-HttpStatus {
+            param($ErrorRecord)
+            try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch { return 0 }
+        }
+
+        # Holt alle Seiten einer Abfrage (Dataverse und die Admin API liefern
+        # bei vielen Treffern einen @odata.nextLink bzw. nextLink).
+        function Get-AllPages {
+            param([string]$Uri, [hashtable]$Headers)
+            $all = [System.Collections.Generic.List[object]]::new()
+            while ($Uri) {
+                $page = Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers
+                if ($page.value) { $all.AddRange([object[]]@($page.value)) }
+                $Uri = if ($page.'@odata.nextLink') { $page.'@odata.nextLink' } else { $page.nextLink }
+            }
+            # Ohne führendes Komma: Die Liste wird in ihre Einträge aufgelöst, so
+            # dass @(Get-AllPages ...) ein normales Array der Treffer ergibt.
+            return $all
+        }
+
+        # Liefert die IDs aller Objekte eines Komponententyps, die in
+        # mindestens einer Solution liegen, die NICHT Default/Active/Basic ist.
+        # Die Default Solution enthält jedes Objekt der Umgebung und sagt daher
+        # nichts darüber aus, ob jemand das Objekt in eine Solution gelegt hat.
+        function Get-SolutionMemberIds {
+            param([string]$ApiBase, [hashtable]$Headers, [int]$ComponentType, [string[]]$ExcludeSolutionIds)
+            $set = [System.Collections.Generic.HashSet[string]]::new()
+            $uri = $ApiBase + "/solutioncomponents?`$select=objectid,_solutionid_value&`$filter=" +
+                   [uri]::EscapeDataString("componenttype eq $ComponentType")
+            foreach ($row in (Get-AllPages $uri $Headers)) {
+                $solId = ([string]$row._solutionid_value).ToLower()
+                if ($ExcludeSolutionIds -notcontains $solId) {
+                    [void]$set.Add(([string]$row.objectid).ToLower())
+                }
+            }
+            return ,$set
+        }
+
+        # Kürzt eine Namensliste für die Textspalten: höchstens $Max Namen
+        # (sortiert), danach "... +N weitere".
+        function Format-NameList {
+            param($Names, [int]$Max = 25)
+            $sorted = @($Names | Sort-Object -Unique)
+            $txt = ($sorted | Select-Object -First $Max) -join ', '
+            if ($sorted.Count -gt $Max) { $txt += ", ... +$($sorted.Count - $Max) weitere" }
+            return $txt
+        }
+
+        # Bezeichnungen für Komponententypen, die nur als Anzahl erscheinen
+        $script:componentLabels = @{
+            2 = 'Spalten'; 9 = 'Optionssätze'; 10 = 'Beziehungen'; 14 = 'Schlüssel'
+            20 = 'Sicherheitsrollen'; 24 = 'Formulare'; 26 = 'Ansichten'; 31 = 'Berichte'
+            36 = 'E-Mail-Vorlagen'; 44 = 'Duplikatregeln'; 59 = 'Diagramme'; 60 = 'Formulare'
+            61 = 'Web Resources'; 62 = 'Sitemaps'; 66 = 'Custom Controls'
+            70 = 'Feldsicherheitsprofile'; 91 = 'Plug-in-Assemblies'; 92 = 'Plug-in-Schritte'
+            371 = 'Connectoren'
+        }
+
+        # Lädt eine Namenstabelle (ID in Kleinbuchstaben -> Name). Fehler führen
+        # nur zu einer leeren Tabelle: dann stehen die Objekte mit ihrer ID da.
+        function Get-NameMap {
+            param([string]$ApiBase, [hashtable]$Headers, [string]$EntitySet, [string]$IdField, [string]$NameField)
+            $m = @{}
+            try {
+                $uri = $ApiBase + "/${EntitySet}?`$select=${IdField},${NameField}"
+                foreach ($r in (Get-AllPages $uri $Headers)) {
+                    $m[([string]$r.$IdField).ToLower()] = [string]$r.$NameField
+                }
+            }
+            catch { $script:contentWarnings += "${EntitySet}: $(Get-ErrorText $_)" }
+            return $m
+        }
+
+        # Ordnet die Komponenten einer Solution nach Typ und löst Namen auf.
+        # $Maps enthält je Typ eine Tabelle ID -> Name.
+        function Get-SolutionContent {
+            param($Rows, $Maps)
+            $c = [ordered]@{
+                flows               = @()
+                canvasApps          = @()
+                modelApps           = @()
+                envVariables        = @()
+                connectionReferences = @()
+                tables              = @()
+                other               = [ordered]@{}
+            }
+            $lists = @{ flows = @(); canvasApps = @(); modelApps = @(); envVariables = @(); connectionReferences = @(); tables = @() }
+            foreach ($row in @($Rows)) {
+                $id = ([string]$row.objectid).ToLower()
+                $t  = [int]$row.componenttype
+                $short = "($($id.Substring(0, [Math]::Min(8, $id.Length))))"
+                switch ($t) {
+                    29  {
+                        # Nur Cloud Flows (category 5) mit Namen, andere Prozesse als Anzahl
+                        if ($Maps.flows.ContainsKey($id)) { $lists.flows += $Maps.flows[$id] }
+                        else { $c.other['Prozesse'] = 1 + [int]$c.other['Prozesse'] }
+                    }
+                    300 { $lists.canvasApps += $(if ($Maps.canvas.ContainsKey($id)) { $Maps.canvas[$id] } else { $short }) }
+                    80  { $lists.modelApps += $(if ($Maps.model.ContainsKey($id)) { $Maps.model[$id] } else { $short }) }
+                    380 { $lists.envVariables += $(if ($Maps.envvar.ContainsKey($id)) { $Maps.envvar[$id] } else { $short }) }
+                    372 { $lists.connectionReferences += $(if ($Maps.connref.ContainsKey($id)) { $Maps.connref[$id] } else { $short }) }
+                    1   { $lists.tables += $(if ($Maps.entity.ContainsKey($id)) { $Maps.entity[$id] } else { $short }) }
+                    381 { }   # Wert einer Umgebungsvariable, gehört zur Definition
+                    default {
+                        $label = if ($script:componentLabels.ContainsKey($t)) { $script:componentLabels[$t] } else { "Typ $t" }
+                        $c.other[$label] = 1 + [int]$c.other[$label]
+                    }
+                }
+            }
+            foreach ($k in $lists.Keys) { $c[$k] = @($lists[$k] | Sort-Object -Unique) }
+            return $c
+        }
+
+        # Textfassung des Inhalts: eine Zeile je Typ, höchstens 25 Namen
+        function Format-ContentText {
+            param($C)
+            $lines = @()
+            if ($C.flows.Count)                { $lines += "Flows: " + (Format-NameList $C.flows) }
+            if ($C.canvasApps.Count)           { $lines += "Canvas Apps: " + (Format-NameList $C.canvasApps) }
+            if ($C.modelApps.Count)            { $lines += "Model-driven Apps: " + (Format-NameList $C.modelApps) }
+            if ($C.envVariables.Count)         { $lines += "Umgebungsvariablen: " + (Format-NameList $C.envVariables) }
+            if ($C.connectionReferences.Count) { $lines += "Connection References: " + (Format-NameList $C.connectionReferences) }
+            if ($C.tables.Count)               { $lines += "Tabellen: " + (Format-NameList $C.tables) }
+            if ($C.other.Count) {
+                $parts = @($C.other.Keys | Sort-Object | ForEach-Object { "$($C.other[$_]) $_" })
+                $lines += "Sonstige: " + ($parts -join ', ')
+            }
+            if ($lines.Count -eq 0) { return '(leer)' }
+            $txt = $lines -join "`n"
+            if ($txt.Length -gt 60000) { $txt = $txt.Substring(0, 60000) }
+            return $txt
+        }
+
+        # JSON-Fassung für die Power App. Wird sie für das Textfeld der Liste
+        # zu lang, bleiben nur die Anzahlen (truncated = true).
+        function Format-ContentJson {
+            param($C)
+            $json = $C | ConvertTo-Json -Depth 5 -Compress
+            if ($json.Length -gt 60000) {
+                $slim = [ordered]@{
+                    truncated = $true
+                    counts    = [ordered]@{
+                        flows = $C.flows.Count; canvasApps = $C.canvasApps.Count; modelApps = $C.modelApps.Count
+                        envVariables = $C.envVariables.Count; connectionReferences = $C.connectionReferences.Count
+                        tables = $C.tables.Count
+                    }
+                    other     = $C.other
+                }
+                $json = $slim | ConvertTo-Json -Depth 5 -Compress
+            }
+            return $json
+        }
+
+        # Liest Solutions und lose Objekte einer Umgebung per Dataverse Web API.
+        # Wirft eine Exception, wenn der Zugriff fehlt (401/403): der Aufrufer
+        # wertet den Statuscode aus.
+        function Get-DataverseInventory {
+            param([string]$InstanceUrl, [string]$EnvId)
+            $root    = $InstanceUrl.TrimEnd('/')
+            $apiBase = "$root/api/data/v9.2"
+            $token   = Get-Token "$root/.default"
+            $h = @{
+                Authorization      = "Bearer $token"
+                'OData-MaxVersion' = '4.0'
+                'OData-Version'    = '4.0'
+                Accept             = 'application/json'
+                Prefer             = 'odata.maxpagesize=5000'
+            }
+
+            # Erste Abfrage ist zugleich der Zugriffstest. IDs der drei
+            # System-Solutions, die jedes Objekt enthalten.
+            $sysFilter = "uniquename eq 'Default' or uniquename eq 'Active' or uniquename eq 'Basic'"
+            $sys = @(Get-AllPages ($apiBase + "/solutions?`$select=solutionid,uniquename,friendlyname,version,ismanaged,modifiedon" +
+                     "&`$expand=publisherid(`$select=uniquename,friendlyname,customizationprefix)&`$filter=" +
+                     [uri]::EscapeDataString($sysFilter)) $h)
+            $sysIds = @($sys | ForEach-Object { ([string]$_.solutionid).ToLower() })
+
+            # Sichtbare Solutions ohne die System-Solutions
+            $solFilter = "isvisible eq true and uniquename ne 'Default' and uniquename ne 'Active' and uniquename ne 'Basic'"
+            $solRaw = @(Get-AllPages ($apiBase + "/solutions?`$select=solutionid,uniquename,friendlyname,version,ismanaged,modifiedon" +
+                        "&`$expand=publisherid(`$select=uniquename,friendlyname,customizationprefix)&`$filter=" +
+                        [uri]::EscapeDataString($solFilter)) $h)
+            # Neue Umgebungen legen automatisch eine Standard-Solution an
+            # ("Common Data Services Default Solution", Name Cr + 5 Zeichen,
+            # Publisher-Prefix cr + 3 Zeichen). Werden Flows und Apps "standard-
+            # mäßig in Solutions" erstellt, landen sie dort. Sie ist also keine
+            # eigene Solution und zählt für "lose Objekte" wie die Default Solution.
+            $isDefaultLike = { ($_.uniquename -match '^Cr[0-9a-f]{5}$') -and ([string]$_.publisherid.customizationprefix -match '^cr[0-9a-f]{3}$') }
+            $sysIds = @($sysIds) + @($solRaw | Where-Object $isDefaultLike | ForEach-Object { ([string]$_.solutionid).ToLower() })
+            # kind: Eigene (unmanaged), Managed, Microsoft (managed von Microsoft,
+            # nicht in der Liste), Standard (automatisch angelegte Cr-Solution) oder
+            # System (Default, Active, Basic)
+            # Managed Solutions von Microsoft: Prefix aus der Liste (Parameter
+            # ignorePrefixes) oder Publisher-Name beginnt mit Microsoft / Dynamics 365
+            $isMicrosoft = { [bool]$_.ismanaged -and (($ignorePrefixes -contains ([string]$_.publisherid.customizationprefix).ToLower()) -or
+                             ([string]$_.publisherid.friendlyname -match '^(Microsoft|Dynamics 365)')) }
+            $solutions = @($solRaw | ForEach-Object {
+                $isDef = [bool](& $isDefaultLike)
+                $isMs  = [bool](& $isMicrosoft)
+                [ordered]@{
+                    solutionId    = ([string]$_.solutionid).ToLower()
+                    uniqueName    = $_.uniquename
+                    friendlyName  = $_.friendlyname
+                    version       = $_.version
+                    managed       = [bool]$_.ismanaged
+                    isDefault     = $isDef
+                    isSystem      = $false
+                    kind          = if ($isDef) { 'Standard' } elseif ($isMs) { 'Microsoft' } elseif ([bool]$_.ismanaged) { 'Managed' } else { 'Eigene' }
+                    publisher     = $_.publisherid.uniquename
+                    publisherName = $_.publisherid.friendlyname
+                    prefix        = $_.publisherid.customizationprefix
+                    modifiedOn    = $_.modifiedon
+                    content       = $null
+                    contentText   = $null
+                    contentJson   = $null
+                }
+            })
+            $sysSolutions = @($sys | ForEach-Object {
+                [ordered]@{
+                    solutionId    = ([string]$_.solutionid).ToLower()
+                    uniqueName    = $_.uniquename
+                    friendlyName  = $_.friendlyname
+                    version       = $_.version
+                    managed       = [bool]$_.ismanaged
+                    isDefault     = $false
+                    isSystem      = $true
+                    kind          = 'System'
+                    publisher     = $_.publisherid.uniquename
+                    publisherName = $_.publisherid.friendlyname
+                    prefix        = $_.publisherid.customizationprefix
+                    modifiedOn    = $_.modifiedon
+                    content       = $null
+                    contentText   = $null
+                    contentJson   = $null
+                }
+            })
+            $solutions = @($solutions) + @($sysSolutions)
+
+            # Lose Cloud Flows: category 5 = Cloud Flow, type 1 = Definition.
+            # Alle Definitionen werden gelesen, weil der Inhalt der Solutions
+            # die Namen der Flows braucht.
+            $wfAll = @(Get-AllPages ($apiBase + "/workflows?`$select=workflowid,name,category&`$filter=" +
+                       [uri]::EscapeDataString("type eq 1")) $h)
+            $flowRows = @($wfAll | Where-Object { [int]$_.category -eq 5 })
+            $flowSet  = Get-SolutionMemberIds $apiBase $h 29 $sysIds
+            $looseFlows = @($flowRows | Where-Object { -not $flowSet.Contains(([string]$_.workflowid).ToLower()) } |
+                            ForEach-Object { [string]$_.name })
+
+            # Lose Canvas Apps
+            $appRows = @(Get-AllPages ($apiBase + "/canvasapps?`$select=canvasappid,displayname") $h)
+            # Apps, die in keiner Solution liegen, stehen nicht in Dataverse, sondern
+            # im Power-Apps-Dienst. Deshalb zusätzlich die Admin API von Power Apps
+            # fragen und fehlende Apps ergänzen. Sie zählen als lose, wenn sie in
+            # keiner echten Solution liegen (Prüfung unten). Schlägt die Abfrage
+            # fehl, kommt eine Warnung, die Zählung ist dann unvollständig.
+            if ($EnvId) {
+                try {
+                    if (-not $script:ppToken) { $script:ppToken = Get-Token "https://service.powerapps.com/.default" }
+                    $ppUri = "https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/$EnvId/apps?api-version=2016-11-01"
+                    $ppApps = @(Get-AllPages $ppUri @{ Authorization = "Bearer $($script:ppToken)" })
+                    $known = [System.Collections.Generic.HashSet[string]]::new()
+                    foreach ($a in $appRows) { [void]$known.Add(([string]$a.canvasappid).ToLower()) }
+                    $extra = @()
+                    foreach ($a in $ppApps) {
+                        $aid = ([string]$a.name).ToLower()
+                        if ($aid -and $known.Add($aid)) {
+                            $extra += [pscustomobject]@{ canvasappid = $aid; displayname = [string]$a.properties.displayName }
+                        }
+                    }
+                    $appRows = @($appRows) + $extra
+                }
+                catch {
+                    $script:appApiWarnings += "${EnvId}: $(Get-ErrorText $_)"
+                }
+            }
+            $appSet  = Get-SolutionMemberIds $apiBase $h 300 $sysIds
+            $looseApps = @($appRows | Where-Object { -not $appSet.Contains(([string]$_.canvasappid).ToLower()) } |
+                           ForEach-Object { [string]$_.displayname })
+
+            # Lose eigene Tabellen (nur abfragen, wenn es welche gibt - die
+            # Komponentenabfrage für Tabellen ist wegen der Systemtabellen groß)
+            # IsCustomEntity ist auch bei Tabellen gesetzt, die Microsoft mitliefert
+            # (z. B. Power Pages). Deshalb werden Tabellen aus managed Solutions
+            # (IsManaged) und Verknüpfungstabellen für N:N-Beziehungen
+            # (IsIntersect) ausgeblendet. Nur die Zahl der ausgeblendeten
+            # Tabellen wird mitgeführt, damit man sie im Log nachvollziehen kann.
+            $allCustom = @(Get-AllPages ($apiBase + "/EntityDefinitions?`$select=MetadataId,LogicalName,IsManaged,IsIntersect&`$filter=" +
+                           [uri]::EscapeDataString("IsCustomEntity eq true")) $h)
+            $tableRows = @($allCustom | Where-Object { -not $_.IsManaged -and -not $_.IsIntersect })
+            $hiddenTables = $allCustom.Count - $tableRows.Count
+            $looseTables = @()
+            if ($tableRows.Count -gt 0) {
+                $tableSet = Get-SolutionMemberIds $apiBase $h 1 $sysIds
+                $looseTables = @($tableRows | Where-Object { -not $tableSet.Contains(([string]$_.MetadataId).ToLower()) } |
+                                 ForEach-Object { [string]$_.LogicalName })
+            }
+
+            # Inhalt der Solutions, die in die Liste kommen (Eigene, Managed und die
+            # Standard-Solution). Microsoft und System bekommen keinen Inhalt: die
+            # System-Solutions enthalten die ganze Umgebung.
+            $contentSols = @($solutions | Where-Object { $_.kind -in @('Eigene', 'Managed', 'Standard') })
+            if ($contentSols.Count -gt 0) {
+                $comps = @{}
+                $typesSeen = [System.Collections.Generic.HashSet[int]]::new()
+                foreach ($s in $contentSols) {
+                    try {
+                        $rows = @(Get-AllPages ($apiBase + "/solutioncomponents?`$select=objectid,componenttype&`$filter=" +
+                                  [uri]::EscapeDataString("_solutionid_value eq $($s.solutionId)")) $h)
+                        $comps[$s.solutionId] = $rows
+                        foreach ($row in $rows) { [void]$typesSeen.Add([int]$row.componenttype) }
+                    }
+                    catch {
+                        $comps[$s.solutionId] = $null
+                        $script:contentWarnings += "Komponenten von '$($s.uniqueName)': $(Get-ErrorText $_)"
+                    }
+                }
+                # Namenstabellen: nur laden, was gebraucht wird
+                $maps = @{ flows = @{}; canvas = @{}; model = @{}; envvar = @{}; connref = @{}; entity = @{} }
+                foreach ($f in $flowRows) { $maps.flows[([string]$f.workflowid).ToLower()] = [string]$f.name }
+                foreach ($a in $appRows)  { $maps.canvas[([string]$a.canvasappid).ToLower()] = [string]$a.displayname }
+                if ($typesSeen.Contains(80))  { $maps.model   = Get-NameMap $apiBase $h 'appmodules' 'appmoduleid' 'name' }
+                if ($typesSeen.Contains(380)) { $maps.envvar  = Get-NameMap $apiBase $h 'environmentvariabledefinitions' 'environmentvariabledefinitionid' 'displayname' }
+                if ($typesSeen.Contains(372)) { $maps.connref = Get-NameMap $apiBase $h 'connectionreferences' 'connectionreferenceid' 'connectionreferencedisplayname' }
+                if ($typesSeen.Contains(1))   { $maps.entity  = Get-NameMap $apiBase $h 'EntityDefinitions' 'MetadataId' 'LogicalName' }
+                foreach ($s in $contentSols) {
+                    if ($null -eq $comps[$s.solutionId]) { continue }
+                    $c = Get-SolutionContent $comps[$s.solutionId] $maps
+                    $s.content     = $c
+                    $s.contentText = Format-ContentText $c
+                    $s.contentJson = Format-ContentJson $c
+                }
+            }
+
+            # Namen der losen Objekte für die Liste (eine Zeile je Typ)
+            $looseLines = @()
+            if ($looseFlows.Count)  { $looseLines += "Flows: " + (Format-NameList $looseFlows) }
+            if ($looseApps.Count)   { $looseLines += "Apps: " + (Format-NameList $looseApps) }
+            if ($looseTables.Count) { $looseLines += "Tabellen: " + (Format-NameList $looseTables) }
+            $looseText = if ($looseLines.Count) { $looseLines -join "`n" } else { $null }
+
+            return @{
+                solutions    = $solutions
+                looseFlows   = $looseFlows
+                looseApps    = $looseApps
+                looseTables  = $looseTables
+                looseText    = $looseText
+                hiddenTables = $hiddenTables
+            }
+        }
+
+        # Owner einer Umgebung: Objekt-ID (usedBy.id) über Graph in
+        # "Name (UPN)" auflösen. Ergebnisse werden zwischengespeichert. Bei einem
+        # Fehler (z. B. fehlende Berechtigung User.Read.All) kommt $null zurück
+        # und der Aufrufer nimmt den Ersteller.
+        $script:graphToken  = $null
+        $script:ownerCache  = @{}
+        $script:ownerErrors = 0
+        $script:ownerErrorText = $null
+        function Resolve-Owner {
+            param([string]$ObjectId)
+            if (-not $ObjectId) { return $null }
+            if ($script:ownerCache.ContainsKey($ObjectId)) { return $script:ownerCache[$ObjectId] }
+            $result = $null
+            try {
+                if (-not $script:graphToken) { $script:graphToken = Get-Token "https://graph.microsoft.com/.default" }
+                $u = Invoke-RestMethod -Method Get -Headers @{ Authorization = "Bearer $($script:graphToken)" } `
+                  -Uri "https://graph.microsoft.com/v1.0/users/${ObjectId}?`$select=displayName,userPrincipalName"
+                if ($u.displayName -and $u.userPrincipalName) { $result = "$($u.displayName) ($($u.userPrincipalName))" }
+                elseif ($u.userPrincipalName) { $result = [string]$u.userPrincipalName }
+                else { $result = [string]$u.displayName }
+            }
+            catch {
+                $script:ownerErrors++
+                if (-not $script:ownerErrorText) { $script:ownerErrorText = Get-ErrorText $_ }
+            }
+            $script:ownerCache[$ObjectId] = $result
+            return $result
+        }
+
+        # Typ für die Auswahlspalte "Typ" der Liste
+        function Get-EnvTypeChoice {
+            param([string]$Sku)
+            foreach ($c in @('Developer', 'Trial', 'Sandbox', 'Production', 'Default', 'Teams')) {
+                if ($Sku -eq $c) { return $c }
+            }
+            return 'Sonstige'
+        }
+
+        # ---------------------------------------------------------------
+        # 1: Alle Umgebungen über die Power Platform Admin API (BAP) lesen
+        # ---------------------------------------------------------------
+        $bapToken   = Get-Token "https://api.bap.microsoft.com/.default"
+        $bapHeaders = @{ Authorization = "Bearer $bapToken" }
+        $envList = @(Get-AllPages "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2020-10-01" $bapHeaders)
+        Write-Host "Umgebungen im Tenant: $($envList.Count)"
+
+        if ($dumpRaw -and $envList.Count -gt 0) {
+            Write-Host "---- Rohdaten der ersten Umgebung ----"
+            $envList[0] | ConvertTo-Json -Depth 8 | Write-Host
+            Write-Host "---- Ende Rohdaten ----"
+        }
+
+        # "alle" (oder leer bzw. *) bedeutet keine Einschränkung. Azure DevOps lässt
+        # bei Textparametern kein leeres Feld zu, daher das Wort als Vorbelegung.
+        # Alle IDs merken, bevor der Filter greift (für "nicht mehr vorhanden")
+        $allEnvIds  = @($envList | ForEach-Object { ([string]$_.name).ToLower() })
+        $isFiltered = $envFilter -notin @('', '*', 'alle')
+        if ($isFiltered) {
+            $envList = @($envList | Where-Object { $_.properties.displayName -like "*$envFilter*" })
+            Write-Host "Nach Namensfilter: $($envList.Count)"
+        }
+
+        # ---------------------------------------------------------------
+        # 1b: Liste "Environments" öffnen und die Zeilen vorab lesen
+        # ---------------------------------------------------------------
+        # Die Zugriffsentscheidung der Menschen steht in der Liste. Sie muss
+        # vor der Schleife bekannt sein: bei "Freigeben" legt die Pipeline in
+        # der Umgebung den Application User an.
+        $listsReady = $false
+        $gh = $null; $siteUri = $null; $lists = @(); $listUri = $null
+        $byEnv = @{}; $envCols = @(); $hasDecisionCol = $false
+        if ($writeToLists) {
+            try {
+                $siteId = "$(SiteId)"
+                if ($siteId -notmatch ',') {
+                    throw "Variable SiteId fehlt oder hat nicht das Format hostname,site-collection-guid,web-guid (Variable Group prüfen)."
+                }
+                $gh = @{ Authorization = "Bearer $(Get-Token 'https://graph.microsoft.com/.default')" }
+                $siteUri = "https://graph.microsoft.com/v1.0/sites/$siteId"
+
+                $lists = @(Get-AllPages "$siteUri/lists?`$select=id,displayName" $gh)
+                $list = $lists | Where-Object { $_.displayName -eq $envListName } | Select-Object -First 1
+                if (-not $list) {
+                    throw "Liste '$envListName' nicht gefunden. Zuerst setup-lists.yml ausführen (oder den Namen in environmentsListName prüfen)."
+                }
+                $listUri = "$siteUri/lists/$($list.id)"
+
+                # Spalten lesen: nur vorhandene Spalten dürfen abgefragt und beschrieben werden
+                $envCols = @(Get-AllPages "$listUri/columns?`$select=name" $gh | ForEach-Object { ([string]$_.name).ToLower() })
+                $hasDecisionCol = $envCols -contains 'accessdecision'
+                $envSelect = 'EnvironmentId,IsPresent' + $(if ($hasDecisionCol) { ',AccessDecision' } else { '' })
+                $newEnvCols = @('accessdecision', 'looseobjects', 'hasdataverse') | Where-Object { $envCols -notcontains $_ }
+                if ($newEnvCols) {
+                    Write-Host "##[warning]In der Liste '$envListName' fehlen Spalten ($($newEnvCols -join ', ')). setup-lists.yml erneut ausführen. Bis dahin bleibt die Zugriffsentscheidung unwirksam."
+                }
+
+                # Vorhandene Zeilen einmal lesen und nach Umgebungs-ID ablegen
+                $items = @(Get-AllPages "$listUri/items?`$expand=fields(`$select=$envSelect)&`$top=999" $gh)
+                foreach ($it in $items) {
+                    $k = ([string]$it.fields.EnvironmentId).ToLower()
+                    if ($k) { $byEnv[$k] = $it }
+                }
+                Write-Host ""
+                Write-Host "Liste '$envListName': $($byEnv.Count) vorhandene Zeilen"
+                $listsReady = $true
+            }
+            catch {
+                $hadIssues = $true
+                Write-Host "##[error]Liste konnte nicht geöffnet werden: $(Get-ErrorText $_)"
+                $st = Get-HttpStatus $_
+                if ($st -eq 401 -or $st -eq 403) {
+                    Write-Host "##[error]Kein ausreichender Zugriff auf die Site. Die App braucht Sites.Selected mit Write-Recht."
+                }
+                Write-Host "##[warning]Ohne Liste gibt es keine Zugriffsentscheidung: es wird kein Application User angelegt, und die Liste wird nicht geschrieben."
+            }
+        }
+
+        # ---------------------------------------------------------------
+        # 2: Je Umgebung Daten sammeln
+        # ---------------------------------------------------------------
+        $inventory = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($e in $envList) {
+            $p = $e.properties
+            $type = [string]$p.environmentSku
+
+            # Managed-Status: protectionLevel Standard = managed, Basic = unmanaged.
+            # Fehlt das Feld, bleibt der Wert $null (unbekannt).
+            $managed = $null
+            $level = [string]$p.governanceConfiguration.protectionLevel
+            if ($level -eq 'Standard') { $managed = $true }
+            elseif ($level -eq 'Basic') { $managed = $false }
+
+            # Erstelldatum einheitlich formatieren (sonst kommt das US-Format aus dem Agent)
+            $created = if ($p.createdTime) { ([datetime]$p.createdTime).ToString('yyyy-MM-dd HH:mm') } else { $null }
+
+            $createdBy = $p.createdBy.userPrincipalName
+            if (-not $createdBy) { $createdBy = $p.createdBy.displayName }
+            $createdIso = if ($p.createdTime) { ([datetime]$p.createdTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+
+            # Owner: usedBy.id über Graph auflösen, sonst der Ersteller
+            $owner = Resolve-Owner ([string]$p.usedBy.id)
+            $ownerSource = 'Graph'
+            if (-not $owner) { $owner = $createdBy; $ownerSource = 'Ersteller' }
+            if (-not $owner) { $ownerSource = 'unbekannt' }
+
+            # Risiko-Hinweis
+            $risk = ''
+            if ($type -eq 'Developer' -and $managed -eq $false) {
+                $risk = 'UNMANAGED DEVELOPER: gesperrt ab 2026-12-15, gelöscht ab 2027-01-15'
+            }
+            elseif ($type -eq 'Developer' -and $null -eq $managed) {
+                $risk = 'Developer, Managed-Status unbekannt - prüfen'
+            }
+
+            $instanceUrl = [string]$p.linkedEnvironmentMetadata.instanceUrl
+
+            # Zugriffsentscheidung aus der Liste (Offen, Freigeben, Freigegeben, Nicht freigeben)
+            $decision = $null
+            if ($listsReady -and $hasDecisionCol) {
+                $row = $byEnv[([string]$e.name).ToLower()]
+                if ($row -and $row.fields.AccessDecision) { $decision = [string]$row.fields.AccessDecision }
+            }
+
+            $rec = [ordered]@{
+                id             = $e.name
+                name           = $p.displayName
+                type           = $type
+                managed        = $managed
+                owner          = $owner
+                ownerSource    = $ownerSource
+                createdBy      = $createdBy
+                createdOn      = $created
+                createdIso     = $createdIso
+                risk           = $risk
+                instanceUrl    = $instanceUrl
+                dataverse      = [bool]$instanceUrl
+                access         = 'n/a'
+                accessDecision = $null
+                writeDecision  = $null
+                action         = ''
+                solutions      = @()
+                looseFlows     = @()
+                looseApps      = @()
+                looseTables    = @()
+                looseText      = $null
+                hiddenTables   = 0
+                error          = $null
+            }
+
+            if (-not $instanceUrl) {
+                $rec.access = 'Kein Dataverse'
+            }
+            else {
+                $dv = $null
+                try {
+                    $dv = Get-DataverseInventory $instanceUrl ([string]$e.name)
+                    $rec.access = 'OK'
+                }
+                catch {
+                    $status = Get-HttpStatus $_
+                    if ($status -eq 401 -or $status -eq 403) {
+                        $rec.access = 'Kein Zugriff'
+                        if ($decision -eq 'Freigeben') {
+                            # Application User anlegen und danach bis zu 3x erneut
+                            # versuchen (die Rechte brauchen einen Moment).
+                            try {
+                                Write-Host "  $($p.displayName): lege Application User an ..."
+                                # Admin API (BAP): legt den Application User mit der Rolle
+                                # System Administrator an. Dafür braucht die App keinen
+                                # Zugriff auf Dataverse (pac admin assign-user braucht ihn).
+                                Invoke-RestMethod -Method Post -Headers $bapHeaders -ContentType 'application/json' `
+                                    -Uri "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/$($e.name)/addAppUser?api-version=2020-10-01" `
+                                    -Body (@{ servicePrincipalAppId = "$(ClientId)" } | ConvertTo-Json) | Out-Null
+                                for ($try = 1; $try -le 3 -and -not $dv; $try++) {
+                                    Start-Sleep -Seconds 20
+                                    try { $dv = Get-DataverseInventory $instanceUrl ([string]$e.name); $rec.access = 'OK (Application User angelegt)' }
+                                    catch { Write-Host "  Versuch ${try}: noch kein Zugriff" }
+                                }
+                            }
+                            catch {
+                                $rec.error = Get-ErrorText $_
+                                $hadIssues = $true
+                            }
+                        }
+                    }
+                    else {
+                        $rec.access = 'Fehler'
+                        $rec.error  = Get-ErrorText $_
+                        $hadIssues  = $true
+                    }
+                }
+                if ($dv) {
+                    $rec.solutions   = $dv.solutions
+                    $rec.looseFlows  = $dv.looseFlows
+                    $rec.looseApps   = $dv.looseApps
+                    $rec.looseTables = $dv.looseTables
+                    $rec.looseText   = $dv.looseText
+                    $rec.hiddenTables = $dv.hiddenTables
+                }
+            }
+
+            # Fehlt der Zugriff, entscheidet der Mensch in der Liste. Neu und
+            # unentschieden: Entscheidung "Offen" und eine Maßnahme.
+            $accessMsg = $null
+            if ($rec.access -eq 'Kein Zugriff') {
+                if ($decision -eq 'Freigegeben') {
+                    # Der Zugriff war freigegeben, ist aber verloren gegangen (zum
+                    # Beispiel Application User entfernt): neu entscheiden lassen.
+                    $rec.accessDecision = 'Offen'
+                    $rec.writeDecision  = 'Offen'
+                    $accessMsg = 'Zugriff war freigegeben, ist aber nicht mehr vorhanden: bitte Zugriffsentscheidung neu treffen (Freigeben oder Nicht freigeben)'
+                }
+                elseif ($decision -eq 'Freigeben') {
+                    $rec.accessDecision = 'Freigeben'
+                    $accessMsg = 'Zugriff freigegeben, aber der Application User ist noch nicht wirksam oder konnte nicht angelegt werden (siehe Zugriff-Log)'
+                }
+                elseif ($decision -eq 'Nicht freigeben') {
+                    $rec.accessDecision = 'Nicht freigeben'
+                }
+                else {
+                    $rec.accessDecision = 'Offen'
+                    $accessMsg = 'Zugriff fehlt: bitte Zugriffsentscheidung treffen (Freigeben oder Nicht freigeben)'
+                }
+            }
+            elseif ($rec.access -like 'OK*' -and $decision -eq 'Freigeben') {
+                # Der Auftrag ist erledigt: Zugriff besteht jetzt.
+                $rec.accessDecision = 'Freigegeben'
+                $rec.writeDecision  = 'Freigegeben'
+            }
+            else { $rec.accessDecision = $decision }
+            $rec.action = (@($risk, $accessMsg) | Where-Object { $_ }) -join '; '
+            $inventory.Add($rec)
+
+            # ---- Log-Ausgabe je Umgebung ----
+            $mText = if ($null -eq $managed) { 'unbekannt' } elseif ($managed) { 'ja' } else { 'nein' }
+            Write-Host ""
+            Write-Host "== $($rec.name) [$type | managed: $mText] =="
+            $ownerText = if ($owner) { $owner } else { '-' }
+            Write-Host "   Owner: $ownerText ($ownerSource) | Ersteller: $createdBy | erstellt: $($rec.createdOn) | Dataverse-Zugriff: $($rec.access)"
+            if ($risk) { Write-Host "   ##[warning]$($rec.name): $risk" }
+            if ($rec.error) { Write-Host "   Fehler: $($rec.error)" }
+            if ($rec.access -eq 'Kein Dataverse') {
+                Write-Host "   Ohne Dataverse: Solutions, Apps und Flows werden (noch) nicht erfasst."
+            }
+            if ($rec.access -eq 'Kein Zugriff') {
+                $decText = if ($rec.accessDecision) { $rec.accessDecision } else { '(Liste nicht verfügbar)' }
+                Write-Host "   Zugriffsentscheidung: $decText"
+            }
+            if ($rec.access -like 'OK*') {
+                $own = @($rec.solutions | Where-Object { $_.kind -eq 'Eigene' })
+                $std = @($rec.solutions | Where-Object { $_.kind -eq 'Standard' -or $_.kind -eq 'System' })
+                $mgd = @($rec.solutions | Where-Object { $_.kind -eq 'Managed' })
+                $ms  = @($rec.solutions | Where-Object { $_.kind -eq 'Microsoft' })
+                Write-Host "   Solutions: $($own.Count) eigene (unmanaged), $($mgd.Count) managed, $($ms.Count) von Microsoft (nicht in der Liste), $($std.Count) Standard-/System-Solutions"
+                foreach ($s in $own) { Write-Host "     - $($s.uniqueName) '$($s.friendlyName)' $($s.version) (Publisher $($s.publisher), Prefix $($s.prefix))" }
+                foreach ($s in $mgd) { Write-Host "     Managed: $($s.uniqueName) '$($s.friendlyName)' $($s.version) (Publisher $($s.publisher), Prefix $($s.prefix))" }
+                foreach ($s in $std) { Write-Host "     $($s.kind): $($s.uniqueName) '$($s.friendlyName)'" }
+                foreach ($s in @($rec.solutions | Where-Object { $_.contentText -and $_.kind -in @('Eigene', 'Managed', 'Standard') })) {
+                    Write-Host "     Inhalt von $($s.uniqueName):"
+                    foreach ($line in ($s.contentText -split "`n")) { Write-Host "         $line" }
+                }
+                Write-Host "   Lose Objekte: Flows $($rec.looseFlows.Count), Canvas Apps $($rec.looseApps.Count), Tabellen $($rec.looseTables.Count) ($($rec.hiddenTables) Systemtabellen ausgeblendet)"
+                foreach ($n in ($rec.looseFlows  | Select-Object -First 10)) { Write-Host "     Flow: $n" }
+                foreach ($n in ($rec.looseApps   | Select-Object -First 10)) { Write-Host "     App:  $n" }
+                foreach ($n in ($rec.looseTables | Select-Object -First 10)) { Write-Host "     Tabelle: $n" }
+            }
+        }
+
+        # ---------------------------------------------------------------
+        # 3: Zusammenfassung und Artefakt
+        # ---------------------------------------------------------------
+        $summary = $inventory | ForEach-Object {
+            [pscustomobject]@{
+                Umgebung       = $_.name
+                Typ            = $_.type
+                Owner          = $_.owner
+                Managed        = if ($null -eq $_.managed) { '?' } elseif ($_.managed) { 'ja' } else { 'nein' }
+                Zugriff        = $_.access
+                EigeneSolutions = if ($_.access -like 'OK*') { @($_.solutions | Where-Object { $_.kind -eq 'Eigene' }).Count } else { '-' }
+                LoseObjekte    = if ($_.access -like 'OK*') { $_.looseFlows.Count + $_.looseApps.Count + $_.looseTables.Count } else { '-' }
+                Risiko         = $_.risk
+            }
+        }
+        Write-Host ""
+        Write-Host "================ Zusammenfassung ================"
+        $summary | Format-Table -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+
+        $outFile = Join-Path "$(Build.ArtifactStagingDirectory)" "inventory.json"
+        $inventory | ConvertTo-Json -Depth 8 | Set-Content -Path $outFile -Encoding utf8
+        Write-Host "Inventar geschrieben: $outFile"
+
+        if ($script:ownerErrors -gt 0) {
+            Write-Host "##[warning]Owner über Graph nicht auflösbar ($($script:ownerErrors) Nutzer-IDs): $($script:ownerErrorText)"
+            Write-Host "##[warning]Prüfen: Graph-Berechtigung User.Read.All (Application) mit Admin-Zustimmung. Bis dahin steht der Ersteller in der Spalte Owner."
+        }
+
+        # ---------------------------------------------------------------
+        # 4: Liste "Environments" pflegen
+        # ---------------------------------------------------------------
+        # Die Pipeline schreibt nur ihre eigenen Spalten. Zugriffsentscheidung
+        # (nur einmalig "Offen", wenn Zugriff fehlt und die Zelle leer ist),
+        # Maßnahme, Rolle und Notiz (Spalten der Menschen) bleiben unberührt.
+        if ($writeToLists -and $listsReady) {
+            try {
+                $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                $nCreated = 0; $nUpdated = 0; $nGone = 0; $nFailed = 0
+
+                foreach ($r in $inventory) {
+                    try {
+                        $isOk = ($r.access -like 'OK*')
+                        $accessState = if ($isOk) { 'OK' } else { [string]$r.access }
+                        $accessLog = $null
+                        if ($r.error) { $accessLog = "${now}: $($r.error)" }
+                        elseif ($r.access -eq 'Kein Zugriff') { $accessLog = "${now}: Die App ist in dieser Umgebung kein Application User." }
+                        elseif ($r.access -like '*Application User angelegt*') { $accessLog = "${now}: Application User wurde angelegt." }
+                        elseif ($r.access -eq 'Kein Dataverse') { $accessLog = "${now}: Umgebung hat kein Dataverse. Solutions, Apps und Flows werden dort (noch) nicht erfasst." }
+                        if ($accessLog -and $accessLog.Length -gt 2000) { $accessLog = $accessLog.Substring(0, 2000) }
+
+                        $fields = [ordered]@{
+                            Title            = [string]$r.name
+                            EnvironmentId    = [string]$r.id
+                            EnvType          = Get-EnvTypeChoice ([string]$r.type)
+                            IsManaged        = if ($null -eq $r.managed) { 'Unbekannt' } elseif ($r.managed) { 'Ja' } else { 'Nein' }
+                            InstanceUrl      = if ($r.instanceUrl) { [string]$r.instanceUrl } else { $null }
+                            OwnerUpn         = $r.owner
+                            CreatedOn        = $r.createdIso
+                            HasDataverse     = if ($r.dataverse) { 'Ja' } else { 'Nein' }
+                            AccessState      = $accessState
+                            AccessLog        = $accessLog
+                            OwnSolutionCount = if ($isOk) { @($r.solutions | Where-Object { $_.kind -eq 'Eigene' }).Count } else { $null }
+                            LooseObjectCount = if ($isOk) { $r.looseFlows.Count + $r.looseApps.Count + $r.looseTables.Count } else { $null }
+                            LooseObjects     = if ($isOk -and $r.looseText) { [string]$r.looseText } else { $null }
+                            ActionRequired   = if ($r.action) { [string]$r.action } else { $null }
+                            IsPresent        = $true
+                            LastSeen         = $now
+                        }
+                        # Spalten, die in der Liste noch fehlen, werden nicht geschrieben
+                        foreach ($k in @('LooseObjects', 'HasDataverse')) {
+                            if ($envCols -notcontains $k.ToLower()) { $fields.Remove($k) }
+                        }
+
+                        $existing = $byEnv[([string]$r.id).ToLower()]
+                        if ($existing) {
+                            # Die Zugriffsentscheidung gehört den Menschen. Die Pipeline setzt
+                            # nur drei Werte: "Offen" (Zelle leer und Zugriff fehlt, oder
+                            # freigegebener Zugriff ist verloren gegangen) und "Freigegeben"
+                            # (Auftrag "Freigeben" erledigt).
+                            if ($hasDecisionCol -and -not $existing.fields.AccessDecision -and $r.accessDecision -eq 'Offen') {
+                                $fields['AccessDecision'] = 'Offen'
+                            }
+                            elseif ($hasDecisionCol -and $r.writeDecision) {
+                                $fields['AccessDecision'] = $r.writeDecision
+                            }
+                            # Aktualisieren: leere Werte werden gelöscht (null)
+                            Invoke-RestMethod -Method Patch -Uri "$listUri/items/$($existing.id)/fields" -Headers $gh `
+                              -Body ($fields | ConvertTo-Json -Depth 5) -ContentType 'application/json; charset=utf-8' | Out-Null
+                            $nUpdated++
+                        }
+                        else {
+                            # Neu: leere Werte weglassen, damit die Standardwerte der Liste greifen
+                            $create = [ordered]@{}
+                            foreach ($key in $fields.Keys) { if ($null -ne $fields[$key]) { $create[$key] = $fields[$key] } }
+                            if ($hasDecisionCol -and $r.accessDecision -eq 'Offen') { $create['AccessDecision'] = 'Offen' }
+                            Invoke-RestMethod -Method Post -Uri "$listUri/items" -Headers $gh `
+                              -Body (@{ fields = $create } | ConvertTo-Json -Depth 6) -ContentType 'application/json; charset=utf-8' | Out-Null
+                            $nCreated++
+                        }
+                    }
+                    catch {
+                        $nFailed++
+                        $hadIssues = $true
+                        Write-Host "##[warning]Liste: Umgebung '$($r.name)' konnte nicht geschrieben werden: $(Get-ErrorText $_)"
+                    }
+                }
+
+                # Umgebungen, die nicht mehr in der Admin API stehen, markieren.
+                # Nur bei vollständigem Abruf und ohne Namensfilter.
+                if ($isFiltered) {
+                    Write-Host "Namensfilter gesetzt: verschwundene Umgebungen werden nicht markiert."
+                }
+                elseif ($allEnvIds.Count -eq 0) {
+                    Write-Host "Die Admin API hat keine Umgebung geliefert: verschwundene Umgebungen werden nicht markiert."
+                }
+                else {
+                    foreach ($key in $byEnv.Keys) {
+                        if ($allEnvIds -notcontains $key) {
+                            $it = $byEnv[$key]
+                            if ($it.fields.IsPresent -eq $false) { continue }
+                            try {
+                                $gone = @{ IsPresent = $false; ActionRequired = 'Umgebung nicht mehr vorhanden' }
+                                Invoke-RestMethod -Method Patch -Uri "$listUri/items/$($it.id)/fields" -Headers $gh `
+                                  -Body ($gone | ConvertTo-Json) -ContentType 'application/json; charset=utf-8' | Out-Null
+                                $nGone++
+                            }
+                            catch {
+                                $nFailed++
+                                $hadIssues = $true
+                                Write-Host "##[warning]Liste: Zeile $key konnte nicht als nicht vorhanden markiert werden: $(Get-ErrorText $_)"
+                            }
+                        }
+                    }
+                }
+                Write-Host "Liste '$envListName': $nCreated neu, $nUpdated aktualisiert, $nGone als nicht mehr vorhanden markiert, $nFailed Fehler."
+
+                # ---- Liste "Solutions" ----
+                $solList = $lists | Where-Object { $_.displayName -eq $solListName } | Select-Object -First 1
+                if (-not $solList) {
+                    $hadIssues = $true
+                    Write-Host "##[warning]Liste '$solListName' nicht gefunden, die Solutions werden nicht geschrieben. Zuerst setup-lists.yml ausführen oder solutionsListName prüfen."
+                }
+                else {
+                    $solUri = "$siteUri/lists/$($solList.id)"
+                    # Spalten zuerst lesen: nur vorhandene dürfen abgefragt und beschrieben werden
+                    $solCols = @(Get-AllPages "$solUri/columns?`$select=name" $gh | ForEach-Object { ([string]$_.name).ToLower() })
+                    $newCols = @('solutionkind', 'solutioncontent', 'solutioncontentjson', 'actionrequired', 'backupdecision', 'sourcestate', 'sourceenvironments') | Where-Object { $solCols -notcontains $_ }
+                    if ($newCols) {
+                        Write-Host "##[warning]In der Liste '$solListName' fehlen Spalten ($($newCols -join ', ')). setup-lists.yml erneut ausführen, dann werden sie ergänzt. Bis dahin bleiben sie leer."
+                    }
+                    $hasDecision = $solCols -contains 'backupdecision'
+                    $solSelect = 'EnvironmentId,UniqueName,IsPresent' + $(if ($hasDecision) { ',BackupDecision' } else { '' }) + $(if ($solCols -contains 'solutionkind') { ',SolutionKind' } else { '' }) + $(if ($solCols -contains 'publisherprefix') { ',PublisherPrefix' } else { '' })
+                    $solItems = @(Get-AllPages "$solUri/items?`$expand=fields(`$select=$solSelect)&`$top=999" $gh)
+                    $solByKey = @{}
+                    foreach ($it in $solItems) {
+                        if ($it.fields.EnvironmentId) {
+                            $k = ("{0}|{1}" -f [string]$it.fields.EnvironmentId, [string]$it.fields.UniqueName).ToLower()
+                            $solByKey[$k] = $it
+                        }
+                    }
+                    Write-Host ""
+                    Write-Host "Liste '$solListName': $($solByKey.Count) vorhandene Zeilen"
+
+                    # Quellen-Index: Eigene (unmanaged) Solutions aller lesbaren Umgebungen,
+                    # Schlüssel eindeutiger Name + Publisher-Prefix. Eine managed Solution
+                    # hat eine Quelle, wenn es dort einen Eintrag gibt.
+                    $srcIndex = @{}
+                    foreach ($r2 in $inventory) {
+                        if ($r2.access -notlike 'OK*') { continue }
+                        foreach ($o in @($r2.solutions | Where-Object { $_.kind -eq 'Eigene' })) {
+                            $sk = ("{0}|{1}" -f [string]$o.uniqueName, [string]$o.prefix).ToLower()
+                            $label = "$($r2.name) ($($o.version)$(if ($r2.risk) { ', Handlungsbedarf' } else { '' }))"
+                            if (-not $srcIndex.ContainsKey($sk)) { $srcIndex[$sk] = [System.Collections.Generic.List[string]]::new() }
+                            $srcIndex[$sk].Add($label)
+                        }
+                    }
+                    # Umgebungen mit Dataverse, in die die Pipeline nicht hineinsehen konnte
+                    $unreadable = @($inventory | Where-Object { $_.dataverse -and $_.access -notlike 'OK*' }).Count
+
+                    $sCreated = 0; $sUpdated = 0; $sGone = 0; $sFailed = 0
+                    $seen = [System.Collections.Generic.HashSet[string]]::new()
+                    $okEnvIds = [System.Collections.Generic.HashSet[string]]::new()
+
+                    foreach ($r in $inventory) {
+                        # Nur Umgebungen, in die die Pipeline hineinsehen konnte
+                        if ($r.access -notlike 'OK*') { continue }
+                        [void]$okEnvIds.Add(([string]$r.id).ToLower())
+                        foreach ($sol in @($r.solutions | Where-Object { $_.kind -in @('Eigene', 'Managed', 'Standard') })) {
+                            $key = ("{0}|{1}" -f [string]$r.id, [string]$sol.uniqueName).ToLower()
+                            [void]$seen.Add($key)
+                            try {
+                                $f = [ordered]@{
+                                    Title           = if ($sol.friendlyName) { [string]$sol.friendlyName } else { [string]$sol.uniqueName }
+                                    UniqueName      = [string]$sol.uniqueName
+                                    EnvironmentId   = [string]$r.id
+                                    EnvironmentName = [string]$r.name
+                                    SolutionVersion = [string]$sol.version
+                                    Publisher       = if ($sol.publisherName) { [string]$sol.publisherName } else { [string]$sol.publisher }
+                                    PublisherPrefix = [string]$sol.prefix
+                                    IsManaged       = if ($sol.managed) { 'Ja' } else { 'Nein' }
+                                    IsPresent       = $true
+                                    LastSeen        = $now
+                                }
+                                $f['SolutionKind']        = [string]$sol.kind
+                                $f['SolutionContent']     = if ($sol.contentText) { [string]$sol.contentText } else { $null }
+                                $f['SolutionContentJson'] = if ($sol.contentJson) { [string]$sol.contentJson } else { $null }
+                                $ex = $solByKey[$key]
+
+                                # Quelle (nur managed Solutions): gibt es irgendwo eine eigene,
+                                # unmanaged Solution mit gleichem Namen und Prefix?
+                                $srcState = $null; $srcEnvs = $null
+                                if ($sol.kind -eq 'Managed') {
+                                    $sk = ("{0}|{1}" -f [string]$sol.uniqueName, [string]$sol.prefix).ToLower()
+                                    if ($srcIndex.ContainsKey($sk)) {
+                                        $srcState = 'Gefunden'
+                                        $srcEnvs  = ($srcIndex[$sk] -join '; ')
+                                    }
+                                    elseif ($unreadable -gt 0) {
+                                        $srcState = 'Nicht prüfbar'
+                                        $srcEnvs  = "$unreadable Umgebung(en) ohne Zugriff nicht geprüft"
+                                    }
+                                    else { $srcState = 'Keine gefunden' }
+                                }
+                                $f['SourceState']        = $srcState
+                                $f['SourceEnvironments'] = $srcEnvs
+
+                                # Sicherungsentscheidung: gehört den Menschen. Die Pipeline setzt
+                                # einmalig "Offen", wenn die Zelle leer ist und eine Entscheidung nötig
+                                # ist: bei eigenen Solutions und bei managed Solutions ohne gefundene
+                                # Quelle (dann bleibt nur der Export der managed Solution).
+                                $decision = if ($ex -and $hasDecision) { [string]$ex.fields.BackupDecision } else { '' }
+                                $needsDecision = ($sol.kind -eq 'Eigene') -or (($sol.kind -eq 'Managed') -and ($srcState -ne 'Gefunden'))
+                                $setOffen = $needsDecision -and (-not $decision)
+                                $effective = if ($setOffen) { 'Offen' } else { $decision }
+
+                                # Hinweis (Maßnahme der Pipeline)
+                                $hint = $null
+                                if ($needsDecision -and $effective -eq 'Offen') {
+                                    if ($sol.kind -eq 'Eigene') { $hint = 'Sicherung entscheiden (Sichern oder Nicht sichern)' }
+                                    elseif ($srcState -eq 'Keine gefunden') { $hint = 'Keine unmanaged Quelle gefunden: Export der managed Solution entscheiden (Sichern oder Nicht sichern)' }
+                                    else { $hint = 'Quelle nicht prüfbar (Umgebung ohne Zugriff): Sicherung entscheiden' }
+                                }
+                                $f['ActionRequired'] = $hint
+
+                                # Spalten, die in der Liste noch fehlen, nicht schreiben
+                                foreach ($k in @('SolutionKind', 'SolutionContent', 'SolutionContentJson', 'ActionRequired', 'SourceState', 'SourceEnvironments')) {
+                                    if ($solCols -notcontains $k.ToLower()) { $f.Remove($k) }
+                                }
+                                if ($hasDecision -and $setOffen) { $f['BackupDecision'] = 'Offen' }
+
+                                if ($ex) {
+                                    Invoke-RestMethod -Method Patch -Uri "$solUri/items/$($ex.id)/fields" -Headers $gh `
+                                      -Body ($f | ConvertTo-Json -Depth 5) -ContentType 'application/json; charset=utf-8' | Out-Null
+                                    $sUpdated++
+                                }
+                                else {
+                                    # Neu: leere Werte weglassen
+                                    foreach ($k in @($f.Keys)) { if ($null -eq $f[$k]) { $f.Remove($k) } }
+                                    Invoke-RestMethod -Method Post -Uri "$solUri/items" -Headers $gh `
+                                      -Body (@{ fields = $f } | ConvertTo-Json -Depth 6) -ContentType 'application/json; charset=utf-8' | Out-Null
+                                    $sCreated++
+                                }
+                            }
+                            catch {
+                                $sFailed++
+                                $hadIssues = $true
+                                Write-Host "##[warning]Solutions: '$($sol.uniqueName)' in '$($r.name)' konnte nicht geschrieben werden: $(Get-ErrorText $_)"
+                            }
+                        }
+                    }
+
+                    # Verschwundene Solutions markieren: entweder die Umgebung war lesbar
+                    # und die Solution kam nicht mehr vor, oder die Umgebung gibt es nicht
+                    # mehr (nur bei vollständigem Abruf und ohne Namensfilter).
+                    foreach ($key in $solByKey.Keys) {
+                        if ($seen.Contains($key)) { continue }
+                        $it = $solByKey[$key]
+                        if ($it.fields.IsPresent -eq $false) { continue }
+                        # Zeilen von System-Solutions und von Microsoft (Prefix aus dem Parameter
+                        # ignorePrefixes) stammen aus früheren Läufen und werden nicht mehr
+                        # gepflegt. Sie lassen sich in der Liste löschen.
+                        if ($it.fields.SolutionKind -eq 'System') { continue }
+                        if ($it.fields.PublisherPrefix -and ($ignorePrefixes -contains ([string]$it.fields.PublisherPrefix).ToLower())) { continue }
+                        $envKey  = ([string]$it.fields.EnvironmentId).ToLower()
+                        $envGone = (-not $isFiltered) -and ($allEnvIds.Count -gt 0) -and ($allEnvIds -notcontains $envKey)
+                        if ($okEnvIds.Contains($envKey) -or $envGone) {
+                            try {
+                                Invoke-RestMethod -Method Patch -Uri "$solUri/items/$($it.id)/fields" -Headers $gh `
+                                  -Body (@{ IsPresent = $false } | ConvertTo-Json) -ContentType 'application/json; charset=utf-8' | Out-Null
+                                $sGone++
+                            }
+                            catch {
+                                $sFailed++
+                                $hadIssues = $true
+                                Write-Host "##[warning]Solutions: Zeile $key konnte nicht als nicht vorhanden markiert werden: $(Get-ErrorText $_)"
+                            }
+                        }
+                    }
+                    Write-Host "Liste '$solListName': $sCreated neu, $sUpdated aktualisiert, $sGone als nicht mehr vorhanden markiert, $sFailed Fehler."
+                }
+            }
+            catch {
+                $hadIssues = $true
+                Write-Host "##[error]Liste konnte nicht geschrieben werden: $(Get-ErrorText $_)"
+                $st = Get-HttpStatus $_
+                if ($st -eq 401 -or $st -eq 403) {
+                    Write-Host "##[error]Kein ausreichender Zugriff auf die Site. Die App braucht Sites.Selected mit Write-Recht."
+                }
+            }
+        }
+
+        if ($script:contentWarnings.Count -gt 0) {
+            Write-Host "##[warning]Inhalt von Solutions: $($script:contentWarnings.Count) Abfrage(n) fehlgeschlagen, erster Fehler: $($script:contentWarnings[0])"
+            $hadIssues = $true
+        }
+        if ($script:appApiWarnings.Count -gt 0) {
+            Write-Host "##[warning]Apps ohne Solution: Abfrage über die Power-Apps-Admin-API bei $($script:appApiWarnings.Count) Umgebung(en) fehlgeschlagen, lose Apps sind dort evtl. unvollständig. Erster Fehler: $($script:appApiWarnings[0])"
+            $hadIssues = $true
+        }
+        if ($hadIssues) {
+            Write-Host "##vso[task.complete result=SucceededWithIssues;]Bei mindestens einer Umgebung oder beim Schreiben der Liste ist ein Fehler aufgetreten (siehe Log)."
+        }
+
+  # Das Ergebnis als Pipeline-Artefakt bereitstellen (Download im Lauf unter "Artefakte")
+  - publish: $(Build.ArtifactStagingDirectory)/inventory.json
+    artifact: inventory
+    displayName: inventory.json veröffentlichen
+    condition: always()
