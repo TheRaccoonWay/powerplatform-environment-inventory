@@ -17,12 +17,26 @@ Umgesetzt: Umgebungen in die Liste `Environments` und Solutions in die Liste `So
 ## Einrichtung
 
 1. Variable Group **`Inventory-Secrets`** (Pipelines › Library) mit `TenantId`, `ClientId`, `ClientSecret` (als Secret) und `SiteId` (SharePoint-Site, Format `hostname,site-collection-guid,web-guid`) anlegen.
-2. Die App Registration braucht die Registrierung als **Power-Platform-Management-App** (`pac admin application register --application-id <ClientId>`, ausgeführt von einem Administrator, [Doku](https://learn.microsoft.com/power-platform/admin/powershell-create-service-principal); die App darf damit die Umgebungen des Tenants wie ein Power Platform Administrator verwalten), die Graph-Berechtigung **User.Read.All** (Application, mit Admin-Zustimmung, für den Owner) und auf der SharePoint-Site **Sites.Selected** mit der Site-Rolle **`manage`** (siehe Abschnitt "Voraussetzung: Site-Berechtigung"). Für `inventory.yml` allein genügt später `write`.
+2. Die App Registration braucht die Registrierung als **Power-Platform-Management-App** (`pac admin application register --application-id <ClientId>`, ausgeführt von einem Administrator, [Doku](https://learn.microsoft.com/power-platform/admin/powershell-create-service-principal)), die Graph-Berechtigung **User.Read.All** (Application, mit Admin-Zustimmung, für den Owner) und auf der SharePoint-Site **Sites.Selected** mit der Site-Rolle **`manage`** (siehe Abschnitt "Voraussetzung: Site-Berechtigung"). Für `inventory.yml` allein genügt später `write`.
 3. Pipelines anlegen: Pipelines › New pipeline › Azure Repos Git › Existing YAML file › `/pipelines/inventory.yml` bzw. `/pipelines/setup-lists.yml`. Die Pipelines laufen in Azure DevOps. Liegt der Code auf GitHub, wählst du bei "Where is your code?" stattdessen **GitHub** (Azure Pipelines braucht dann Zugriff auf das Repo) oder kopierst die YAML-Dateien in ein Azure-DevOps-Repo.
 4. `inventory.yml`: erst `setup-lists.yml` ausführen, damit die Listen existieren. Dann läuft `inventory.yml` und trägt jede Umgebung in die Liste `Environments` und jede Solution in die Liste `Solutions` ein (Parameter `writeToLists`, Standard an). Der Lauf ist wiederholbar: Er aktualisiert nur die Spalten der Pipeline und lässt "Zugriffsentscheidung", "Sicherungsentscheidung", "Maßnahme", "Rolle" und "Notiz" unberührt. Umgebungen und Solutions, die es nicht mehr gibt, bleiben mit "Vorhanden = Nein" stehen. Bei Umgebungen ohne Zugriff bleiben die Solution-Zeilen unverändert, weil dort nicht bekannt ist, was in ihnen liegt. Bei geänderten Listennamen die Parameter `environmentsListName` und `solutionsListName` setzen.
 5. `setup-lists.yml`: erst als Trockenlauf, dann mit `dryRun` = aus die Listen anlegen. Pro Liste gibt es ein Häkchen (Environments, Solutions). Der Lauf ist wiederholbar und ergänzt nur fehlende Listen und Spalten. Kommt später eine Spalte dazu (z. B. "Art" in der Liste Solutions), `setup-lists.yml` einfach noch einmal laufen lassen. Jede Spalte hat eine Beschreibung (Listeneinstellungen › Spalte öffnen): wofür sie ist, wer sie schreibt (Pipeline, Mensch, später Backup) und wo sie verwendet wird. Der Lauf gleicht die Beschreibungen bestehender Spalten an, sie werden also zentral in `setup-lists.yml` gepflegt (Parameter `-Desc` der Spalte). Von Hand geänderte Beschreibungen werden dabei überschrieben.
 
 Details zu Parametern, Voraussetzungen und Grenzen stehen im Kopf von `pipelines/inventory.yml`.
+
+## Was die App braucht (Berechtigungen im Überblick)
+
+Alles läuft mit einer App Registration (`ClientId`, `ClientSecret`, `TenantId` aus der Variable Group).
+
+| Wo | Was | Wofür |
+| --- | --- | --- |
+| Power Platform | App als Power-Platform-Management-App registriert (einmalig durch einen Tenant-Admin, siehe Microsoft Learn "Creating a service principal application using PowerShell/API"). Die App wird dann wie ein Power-Platform-Administrator behandelt. | Umgebungsliste (Admin API), Apps ohne Solution (Power-Apps-Admin-API), Application User anlegen (`addAppUser`) |
+| Dataverse je Umgebung | Application User der App mit der Rolle System Administrator | Solutions, Flows, Apps und Tabellen der Umgebung lesen. Fehlt er, meldet das Inventar "Kein Zugriff". Bei "Freigeben" legt die Pipeline ihn an. |
+| Microsoft Graph | `User.Read.All` (Application, mit Admin-Zustimmung) | Owner der Umgebung auflösen. Fehlt es, steht der Ersteller in der Liste. |
+| Microsoft Graph | `Sites.Selected` (Application, mit Admin-Zustimmung) und auf der Site die Rolle `write` (`inventory.yml`) bzw. `manage` (`setup-lists.yml`) | SharePoint-Listen lesen, anlegen und schreiben |
+| Azure DevOps | Zugriff der Pipelines auf die Variable Group `Inventory-Secrets` | Zugangsdaten bereitstellen |
+
+Es sind keine API-Berechtigungen für Dataverse oder Power Apps in der App Registration nötig, weil die Pipeline sich per Client Credentials anmeldet. Verändert wird nur: die SharePoint-Listen und, auf ausdrückliche Wahl "Freigeben", der Application User in der Zielumgebung. Alles andere ist lesend. Für das spätere `backup.yml` kommt Schreibrecht auf das Repo dazu.
 
 ## Die Listen im Alltag
 
@@ -61,14 +75,13 @@ Die Berechtigung setzt ein Admin im [Graph Explorer](https://developer.microsoft
 
 Änderungen an Berechtigungen können einige Minuten brauchen, bis sie greifen.
 
-## Sicherheit und Berechtigungen
+## Sicherheit
 
-Die App Registration bekommt weitreichende Rechte. Bitte vor dem Einsatz lesen:
+Die Übersicht der Berechtigungen steht oben. Zusätzlich gilt:
 
 - Als Management-App darf die App alle Umgebungen des Tenants verwalten. `inventory.yml` liest nur, mit einer Ausnahme: dem Anlegen des Application Users (nächster Punkt).
 - Bei der Zugriffsentscheidung "Freigeben" legt die Pipeline in der Umgebung einen Application User mit der Rolle **System Administrator** an. Das ändert die Umgebung und geschieht nur auf die ausdrückliche Wahl eines Menschen in der Liste. Wer die Liste bearbeiten darf, kann also Zugriff freigeben: die Berechtigungen auf der Liste entsprechend eng halten. Wer das nicht will, wählt "Nicht freigeben".
 - `ClientSecret` gehört als Secret in die Variable Group und nie ins Repo. Secrets laufen ab: Ablaufdatum notieren und rechtzeitig erneuern.
-- `User.Read.All` (Application) erlaubt der App, Benutzer des Tenants zu lesen. Es wird nur für den Owner-Namen gebraucht. Ohne die Berechtigung steht der Ersteller in der Spalte.
 - Die Site-Rolle `manage` nach dem Anlegen der Listen auf `write` zurücksetzen.
 
 ## Stand und Hinweise
