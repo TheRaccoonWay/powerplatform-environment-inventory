@@ -35,7 +35,7 @@
 #     exportiert wird (Offen, Sichern, Nicht sichern).
 #
 # Wer schreibt welche Spalte?
-#   Pipeline (inventory.yml, ab Stufe 2): alles, was nicht unter "Menschen"
+#   Pipeline (inventory.yml): alles, was nicht unter "Menschen"
 #     steht. Das Backup (später) schreibt BackupStatus, LastBackup, BackupCommit.
 #   Menschen (später auch die Power App):
 #     Environments: AccessDecision (Zugriffsentscheidung), Measure, EnvRole, Notes
@@ -52,8 +52,9 @@
 #   TenantId, ClientId, ClientSecret der App Registration und SiteId der
 #   SharePoint-Site (zusammengesetzte ID: {hostname},{site-collection-guid},
 #   {web-guid}). Die App braucht auf der Site Sites.Selected mit Schreibrecht.
-#   Für das Anlegen einer Liste reicht Write wahrscheinlich, sonst ist Manage
-#   oder Owner nötig. Bei 403 meldet die Pipeline das im Log.
+#   Für das Anlegen einer Liste braucht die App die Site-Rolle manage. Mit write
+#   endet es mit 403, die Rolle owner nimmt die Site nicht an (siehe README).
+#   Bei 403 meldet die Pipeline das im Log.
 # =============================================================================
 
 trigger: none
@@ -341,7 +342,7 @@ steps:
             $status = Get-HttpStatus $_
             Write-Host "##[error]$(Get-ErrorText $_)"
             if ($status -eq 403 -or $status -eq 401) {
-                Write-Host "##[error]Kein ausreichender Zugriff auf die Site. Die App braucht Sites.Selected mit Write-Recht, zum Anlegen von Listen eventuell Manage oder Owner."
+                Write-Host "##[error]Kein ausreichender Zugriff auf die Site. Die App braucht Sites.Selected: mit der Site-Rolle manage zum Anlegen von Listen, mit write zum Schreiben von Einträgen."
             }
             elseif ($status -eq 404) {
                 Write-Host "##[error]Site nicht gefunden. SiteId in der Variable Group prüfen (Format: hostname,site-collection-guid,web-guid)."
