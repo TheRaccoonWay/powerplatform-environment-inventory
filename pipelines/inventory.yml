@@ -689,7 +689,7 @@ steps:
                 # Spalten lesen: nur vorhandene Spalten dürfen abgefragt und beschrieben werden
                 $envCols = @(Get-AllPages "$listUri/columns?`$select=name" $gh | ForEach-Object { ([string]$_.name).ToLower() })
                 $hasDecisionCol = $envCols -contains 'accessdecision'
-                $envSelect = 'EnvironmentId,IsPresent' + $(if ($hasDecisionCol) { ',AccessDecision' } else { '' })
+                $envSelect = 'EnvironmentId,IsPresent' + $(if ($hasDecisionCol) { ',AccessDecision' } else { '' }) + $(if ($envCols -contains 'accesslog') { ',AccessLog' } else { '' })
                 $newEnvCols = @('accessdecision', 'looseobjects', 'hasdataverse') | Where-Object { $envCols -notcontains $_ }
                 if ($newEnvCols) {
                     Write-Host "##[warning]In der Liste '$envListName' fehlen Spalten ($($newEnvCols -join ', ')). setup-lists.yml erneut ausführen. Bis dahin bleibt die Zugriffsentscheidung unwirksam."
@@ -952,12 +952,27 @@ steps:
                     try {
                         $isOk = ($r.access -like 'OK*')
                         $accessState = if ($isOk) { 'OK' } else { [string]$r.access }
-                        $accessLog = $null
-                        if ($r.error) { $accessLog = "${now}: $($r.error)" }
-                        elseif ($r.access -eq 'Kein Zugriff') { $accessLog = "${now}: Die App ist in dieser Umgebung kein Application User." }
-                        elseif ($r.access -like '*Application User angelegt*') { $accessLog = "${now}: Application User wurde angelegt." }
-                        elseif ($r.access -eq 'Kein Dataverse') { $accessLog = "${now}: Umgebung hat kein Dataverse. Solutions, Apps und Flows werden dort (noch) nicht erfasst." }
-                        if ($accessLog -and $accessLog.Length -gt 2000) { $accessLog = $accessLog.Substring(0, 2000) }
+                        # Fortlaufendes Log: neueste Meldung oben, ältere bleiben stehen.
+                        # Eine Meldung kommt nur dazu, wenn sie sich von der letzten unterscheidet.
+                        $accessMsg = $null
+                        if ($r.error) { $accessMsg = [string]$r.error }
+                        elseif ($r.access -eq 'Kein Zugriff') { $accessMsg = 'Die App ist in dieser Umgebung kein Application User.' }
+                        elseif ($r.access -like '*Application User angelegt*') { $accessMsg = 'Application User wurde angelegt.' }
+                        elseif ($r.access -eq 'Kein Dataverse') { $accessMsg = 'Umgebung hat kein Dataverse. Solutions, Apps und Flows werden dort (noch) nicht erfasst.' }
+                        elseif ($isOk) { $accessMsg = 'Zugriff vorhanden.' }
+                        # Mehrzeilige Fehlertexte auf eine Zeile bringen und kürzen (ein Eintrag = eine Zeile)
+                        if ($accessMsg) { $accessMsg = ($accessMsg -replace '\s*\r?\n\s*', ' '); if ($accessMsg.Length -gt 2000) { $accessMsg = $accessMsg.Substring(0, 2000) } }
+                        $oldLog = $null
+                        $existingEnv = $byEnv[([string]$r.id).ToLower()]
+                        if ($existingEnv -and $existingEnv.fields.AccessLog) { $oldLog = [string]$existingEnv.fields.AccessLog }
+                        $lastMsg = if ($oldLog) { (($oldLog -split "`n")[0]) -replace '^\S+:\s', '' } else { $null }
+                        $accessLog = $oldLog
+                        # "Zugriff vorhanden" nur eintragen, wenn davor schon etwas im Log stand
+                        if ($accessMsg -and $accessMsg -ne $lastMsg -and -not ($isOk -and -not $oldLog)) {
+                            $accessLog = "${now}: $accessMsg" + $(if ($oldLog) { "`n$oldLog" } else { '' })
+                        }
+                        # Älteste Einträge zuerst kürzen (Spalte ist Text, höchstens ca. 60000 Zeichen)
+                        if ($accessLog -and $accessLog.Length -gt 50000) { $accessLog = $accessLog.Substring(0, 50000) }
 
                         $fields = [ordered]@{
                             Title            = [string]$r.name
